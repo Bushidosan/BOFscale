@@ -556,13 +556,7 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		if resp.StatusCode != 500 {
-			return nil, fmt.Errorf("unexpected HTTP response: %s", resp.Status)
-		} else {
-			// We assume if we get a 500 error, not standard websocket comms
-			// is being blocked through some intermediate proxy
-			return a.DialJS(ctx)
-		}
+		return a.DialJS(ctx)
 	}
 
 	// From here on, the underlying net.Conn is ours to use, but there

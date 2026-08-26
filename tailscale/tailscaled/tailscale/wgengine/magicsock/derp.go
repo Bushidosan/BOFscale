@@ -832,7 +832,7 @@ func (c *Conn) maybeCloseDERPsOnRebind(okayLocalIPs []netip.Prefix) {
 			c.closeOrReconnectDERPLocked(regionID, "rebind-no-localaddr")
 			continue
 		}
-		if !tsaddr.PrefixesContainsIP(okayLocalIPs, la.Addr()) {
+		if la.Addr().IsValid() && !tsaddr.PrefixesContainsIP(okayLocalIPs, la.Addr()) {
 			c.closeOrReconnectDERPLocked(regionID, "rebind-default-route-change")
 			continue
 		}

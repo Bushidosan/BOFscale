@@ -349,6 +349,7 @@ func (c *Client) dialWebsocket(ctx context.Context, caller string, reg *tailcfg.
 		derp.IsProber(c.IsProber),
 	)
 	if err != nil {
+		go conn.Close()
 		return nil, 0, err
 	}
 	if c.preferred {
@@ -361,6 +362,7 @@ func (c *Client) dialWebsocket(ctx context.Context, caller string, reg *tailcfg.
 	c.client = derpClient
 	c.netConn = conn
 	c.connGen++
+	c.atomicState.Store(ConnectedState{Connected: true})
 
 	return c.client, c.connGen, nil
 }
