@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package cli contains the cmd/tailscale CLI code in a package that can be included
@@ -6,6 +6,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,8 +21,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/mattn/go-colorable"
-	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
@@ -29,6 +28,7 @@ import (
 	"tailscale.com/feature"
 	"tailscale.com/paths"
 	"tailscale.com/util/slicesx"
+	"tailscale.com/util/testenv"
 	"tailscale.com/version/distro"
 )
 
@@ -93,8 +93,8 @@ var localClient = local.Client{
 	Socket: paths.DefaultTailscaledSocket(),
 }
 
-// Run runs the CLI. The args do not include the binary name.
-func Run(args []string) (err error) {
+// RunWithContext runs the CLI. The args do not include the binary name.
+func RunWithContext(ctx context.Context, args []string) (err error) {
 	if runtime.GOOS == "linux" && os.Getenv("GOKRAZY_FIRST_START") == "1" && distro.Get() == distro.Gokrazy && os.Getppid() == 1 && len(args) == 0 {
 		// We're running on gokrazy and the user did not specify 'up'.
 		// Don't run the tailscale CLI and spam logs with usage; just exit.
@@ -125,7 +125,7 @@ func Run(args []string) (err error) {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		if noexec := (ffcli.NoExecError{}); errors.As(err, &noexec) {
+		if noexec, ok := errors.AsType[ffcli.NoExecError](err); ok {
 			// When the user enters an unknown subcommand, ffcli tries to run
 			// the closest valid parent subcommand with everything else as args,
 			// returning NoExecError if it doesn't have an Exec function.
@@ -164,7 +164,7 @@ func Run(args []string) (err error) {
 		return
 	}
 
-	err = rootCmd.Run(context.Background())
+	err = rootCmd.Run(ctx)
 	if local.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
 		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s'.\nTo not require root, use 'sudo tailscale set --operator=$USER' once.", err, strings.Join(args, " "))
 	}
@@ -172,6 +172,11 @@ func Run(args []string) (err error) {
 		return nil
 	}
 	return err
+}
+
+// Run is equivalent to calling [RunWithContext] with the background context.
+func Run(args []string) (err error) {
+	return RunWithContext(context.Background(), args)
 }
 
 type onceFlagValue struct {
@@ -195,33 +200,57 @@ func (v *onceFlagValue) IsBoolFlag() bool {
 	return ok && bf.IsBoolFlag()
 }
 
-// noDupFlagify modifies c recursively to make all the
-// flag values be wrappers that permit setting the value
-// at most once.
-func noDupFlagify(c *ffcli.Command) {
-	if c.FlagSet != nil {
-		c.FlagSet.VisitAll(func(f *flag.Flag) {
-			f.Value = &onceFlagValue{Value: f.Value}
-		})
+// noDupFlagify modifies c recursively to make all the flag values be
+// wrappers that permit setting the value at most once. If tb is
+// non-nil, the original values are restored when the test completes.
+func noDupFlagify(c *ffcli.Command, tb testenv.TB) {
+	if tb == nil && testenv.InTest() {
+		return
 	}
-	for _, sub := range c.Subcommands {
-		noDupFlagify(sub)
+	type restore struct {
+		f *flag.Flag
+		v flag.Value
+	}
+	var restores []restore
+	var walk func(*ffcli.Command)
+	walk = func(c *ffcli.Command) {
+		if c.FlagSet != nil {
+			c.FlagSet.VisitAll(func(f *flag.Flag) {
+				if tb != nil {
+					restores = append(restores, restore{f, f.Value})
+				}
+				f.Value = &onceFlagValue{Value: f.Value}
+			})
+		}
+		for _, sub := range c.Subcommands {
+			walk(sub)
+		}
+	}
+	walk(c)
+	if tb != nil {
+		tb.Cleanup(func() {
+			for _, r := range restores {
+				r.f.Value = r.v
+			}
+		})
 	}
 }
 
 var (
 	fileCmd,
 	sysPolicyCmd,
+	maybeRoutecheckCmd,
 	maybeWebCmd,
 	maybeDriveCmd,
-	maybeNetlockCmd,
+	maybeTailnetLockCmd,
 	maybeFunnelCmd,
 	maybeServeCmd,
 	maybeCertCmd,
+	maybeUpdateCmd,
 	_ func() *ffcli.Command
 )
 
-func newRootCmd() *ffcli.Command {
+func newRootCmd(tb ...testenv.TB) *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
 	rootfs.Func("socket", "path to tailscaled socket", func(s string) error {
 		localClient.Socket = s
@@ -246,12 +275,14 @@ change in the future.
 			upCmd,
 			downCmd,
 			setCmd,
+			getCmd,
 			loginCmd,
 			logoutCmd,
 			switchCmd,
 			configureCmd(),
 			nilOrCall(sysPolicyCmd),
 			netcheckCmd,
+			nilOrCall(maybeRoutecheckCmd),
 			ipCmd,
 			dnsCmd,
 			statusCmd,
@@ -261,22 +292,25 @@ change in the future.
 			sshCmd,
 			nilOrCall(maybeFunnelCmd),
 			nilOrCall(maybeServeCmd),
+			serviceCmd,
 			versionCmd,
 			nilOrCall(maybeWebCmd),
 			nilOrCall(fileCmd),
 			bugReportCmd,
 			nilOrCall(maybeCertCmd),
-			nilOrCall(maybeNetlockCmd),
+			nilOrCall(maybeTailnetLockCmd),
 			licensesCmd,
 			exitNodeCmd(),
-			updateCmd,
+			nilOrCall(maybeUpdateCmd),
 			whoisCmd,
+			whoamiCmd,
 			debugCmd(),
 			nilOrCall(maybeDriveCmd),
 			idTokenCmd,
 			configureHostCmd(),
 			systrayCmd,
 			appcRoutesCmd,
+			waitCmd,
 		),
 		FlagSet: rootfs,
 		Exec: func(ctx context.Context, args []string) error {
@@ -294,11 +328,19 @@ change in the future.
 		if w.UsageFunc == nil {
 			w.UsageFunc = usageFunc
 		}
+		if w.FlagSet != nil {
+			// If flags cannot be parsed, redact any keys in the error output .
+			w.FlagSet.SetOutput(sanitizeOutput(w.FlagSet.Output()))
+		}
 		return true
 	})
 
 	ffcomplete.Inject(rootCmd, func(c *ffcli.Command) { c.LongHelp = hidden + c.LongHelp }, usageFunc)
-	noDupFlagify(rootCmd)
+	var t testenv.TB
+	if len(tb) > 0 {
+		t = tb[0]
+	}
+	noDupFlagify(rootCmd, t)
 	return rootCmd
 }
 
@@ -447,7 +489,7 @@ func usageFuncOpt(c *ffcli.Command, withDefaults bool) string {
 
 			showDefault := f.DefValue != "" && withDefaults
 			// Issue 6766: don't show the default Windows socket path. It's long
-			// and distracting. And people on on Windows aren't likely to ever
+			// and distracting. And people on Windows aren't likely to ever
 			// change it anyway.
 			if runtime.GOOS == "windows" && f.Name == "socket" && strings.HasPrefix(f.DefValue, `\\.\pipe\ProtectedPrefix\`) {
 				showDefault = false
@@ -475,20 +517,6 @@ func isBoolFlag(f *flag.Flag) bool {
 func countFlags(fs *flag.FlagSet) (n int) {
 	fs.VisitAll(func(*flag.Flag) { n++ })
 	return n
-}
-
-// colorableOutput returns a colorable writer if stdout is a terminal (not, say,
-// redirected to a file or pipe), the Stdout writer is os.Stdout (we're not
-// embedding the CLI in wasm or a mobile app), and NO_COLOR is not set (see
-// https://no-color.org/). If any of those is not the case, ok is false
-// and w is Stdout.
-func colorableOutput() (w io.Writer, ok bool) {
-	if Stdout != os.Stdout ||
-		os.Getenv("NO_COLOR") != "" ||
-		!isatty.IsTerminal(os.Stdout.Fd()) {
-		return Stdout, false
-	}
-	return colorable.NewColorableStdout(), true
 }
 
 type commandDoc struct {
@@ -565,4 +593,42 @@ func fixTailscaledConnectError(origErr error) error {
 		return f(origErr)
 	}
 	return origErr
+}
+
+func sanitizeOutput(w io.Writer) io.Writer {
+	return sanitizeWriter{w}
+}
+
+type sanitizeWriter struct {
+	w io.Writer
+}
+
+// Write logically replaces /tskey-[A-Za-z0-9-]+/ with /tskey-XXXX.../ in buf
+// before writing to the underlying writer.
+//
+// We avoid the "regexp" package to not bloat the minbox build, and without
+// making this a featuretag-omittable protection.
+func (w sanitizeWriter) Write(buf []byte) (int, error) {
+	const prefix = "tskey-"
+	scrub := buf
+	for {
+		i := bytes.Index(scrub, []byte(prefix))
+		if i == -1 {
+			break
+		}
+		scrub = scrub[i+len(prefix):]
+
+		for i, b := range scrub {
+			if (b >= 'a' && b <= 'z') ||
+				(b >= 'A' && b <= 'Z') ||
+				(b >= '0' && b <= '9') ||
+				b == '-' {
+				scrub[i] = 'X'
+			} else {
+				break
+			}
+		}
+	}
+
+	return w.w.Write(buf)
 }

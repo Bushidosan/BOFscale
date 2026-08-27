@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -23,15 +24,57 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
+	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus/eventbustest"
 )
 
 func (rr resolverAndDelay) String() string {
 	return fmt.Sprintf("%v+%v", rr.name, rr.startDelay)
+}
+
+// setTCFlagInPacket sets the TC flag in a DNS packet (for testing).
+func setTCFlagInPacket(packet []byte) {
+	if len(packet) < headerBytes {
+		return
+	}
+	flags := binary.BigEndian.Uint16(packet[2:4])
+	flags |= dnsFlagTruncated
+	binary.BigEndian.PutUint16(packet[2:4], flags)
+}
+
+// clearTCFlagInPacket clears the TC flag in a DNS packet (for testing).
+func clearTCFlagInPacket(packet []byte) {
+	if len(packet) < headerBytes {
+		return
+	}
+	flags := binary.BigEndian.Uint16(packet[2:4])
+	flags &^= dnsFlagTruncated
+	binary.BigEndian.PutUint16(packet[2:4], flags)
+}
+
+// verifyEDNSBufferSize verifies a request has the expected EDNS buffer size.
+func verifyEDNSBufferSize(t *testing.T, request []byte, expectedSize uint16) {
+	t.Helper()
+	ednsSize, hasEDNS := getEDNSBufferSize(request)
+	if !hasEDNS {
+		t.Fatalf("request should have EDNS OPT record")
+	}
+	if ednsSize != expectedSize {
+		t.Fatalf("request EDNS size = %d, want %d", ednsSize, expectedSize)
+	}
+}
+
+// setupForwarderWithTCPRetriesDisabled returns a forwarder modifier that disables TCP retries.
+func setupForwarderWithTCPRetriesDisabled() func(*forwarder) {
+	return func(fwd *forwarder) {
+		fwd.controlKnobs = &controlknobs.Knobs{}
+		fwd.controlKnobs.DisableDNSForwarderTCPRetries.Store(true)
+	}
 }
 
 func TestResolversWithDelays(t *testing.T) {
@@ -103,9 +146,19 @@ func TestResolversWithDelays(t *testing.T) {
 			want: o("https://dns.nextdns.io/c3a884"),
 		},
 		{
-			name: "controld-ipv6-expand",
+			// ID-encoded Control D addresses are legacy port-53-only
+			// endpoints (see #20433); they must not be upgraded to DoH and
+			// instead pass through as ordinary port-53 resolvers.
+			name: "controld-ipv6-id-encoded-not-doh",
 			in:   q("2606:1a40:0:6:7b5b:5949:35ad:0"),
-			want: o("https://dns.controld.com/hyq3ipr2ct"),
+			want: o("2606:1a40:0:6:7b5b:5949:35ad:0"),
+		},
+		{
+			// The free anycast resolvers (freedns.controld.com/pN) do serve
+			// DoH and are upgraded.
+			name: "controld-free-anycast-doh",
+			in:   q("2606:1a40::1"),
+			want: o("https://freedns.controld.com/p1", "2606:1a40::1+0.5s"),
 		},
 		{
 			name: "controld-doh-input",
@@ -183,6 +236,84 @@ func TestGetKnownDoHClientForProvider(t *testing.T) {
 	}
 	defer res.Body.Close()
 	t.Logf("Got: %+v", res)
+}
+
+// TestControlDPremiumDoHLive exercises the real DoH dial path against Control D's
+// live infrastructure for a premium resolver, to confirm end-to-end that we use
+// reachable DoH endpoints (see ESC-30: we previously synthesized per-resolver
+// IPv6 addresses that only speak plaintext DNS on port 53 and refuse :443).
+//
+// It is disabled by default and only runs when TS_TEST_CONTROLD_RESOLVER_ID is
+// set to a Control D premium resolver ID (the path component of a
+// https://dns.controld.com/<id> DoH URL). For example:
+//
+//	TS_TEST_CONTROLD_RESOLVER_ID=abc123 go test ./net/dns/resolver/ \
+//	    -run TestControlDPremiumDoHLive -v
+//
+// To reproduce the pre-fix failure, temporarily revert DoHIPsOfBase to return
+// the controlDv6Gen-synthesized addresses: on an IPv6-only network this test
+// then fails with a connection error instead of a successful response.
+func TestControlDPremiumDoHLive(t *testing.T) {
+	id := os.Getenv("TS_TEST_CONTROLD_RESOLVER_ID")
+	if id == "" {
+		t.Skip("set TS_TEST_CONTROLD_RESOLVER_ID=<premium resolver id> to run")
+	}
+
+	logf := tstest.WhileTestRunningLogger(t)
+	bus := eventbustest.NewBus(t)
+	netMon, err := netmon.New(bus, logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialer tsdial.Dialer
+	dialer.SetNetMon(netMon)
+	dialer.SetBus(bus)
+	fwd := newForwarder(logf, netMon, nil, &dialer, health.NewTracker(bus), nil)
+
+	urlBase := "https://dns.controld.com/" + id
+	c, ok := fwd.getKnownDoHClientForProvider(urlBase)
+	if !ok {
+		t.Fatalf("no known DoH client for %q", urlBase)
+	}
+	t.Logf("dialing DoH IPs: %v", publicdns.DoHIPsOfBase(urlBase))
+
+	// Build an A query for example.com.
+	builder := dns.NewBuilder(nil, dns.Header{RecursionDesired: true})
+	builder.StartQuestions()
+	if err := builder.Question(dns.Question{
+		Name:  dns.MustNewName("example.com."),
+		Type:  dns.TypeA,
+		Class: dns.ClassINET,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, err := fwd.sendDoH(ctx, urlBase, c, query)
+	if err != nil {
+		t.Fatalf("sendDoH: %v", err)
+	}
+	if rcode := getRCode(res); rcode != dns.RCodeSuccess {
+		t.Fatalf("got rcode %v, want success", rcode)
+	}
+
+	var p dns.Parser
+	if _, err := p.Start(res); err != nil {
+		t.Fatalf("parsing response: %v", err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("skipping questions: %v", err)
+	}
+	if _, err := p.AnswerHeader(); err != nil {
+		t.Fatalf("no answers returned: %v", err)
+	}
+	t.Logf("ControlD premium DoH query for example.com succeeded (%d bytes)", len(res))
 }
 
 func BenchmarkNameFromQuery(b *testing.B) {
@@ -288,7 +419,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 		udpLn *net.UDPConn
 		err   error
 	)
-	for try := 0; try < tries; try++ {
+	for range tries {
 		if tcpLn != nil {
 			tcpLn.Close()
 			tcpLn = nil
@@ -352,9 +483,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 	var wg sync.WaitGroup
 
 	if opts == nil || !opts.SkipTCP {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				conn, err := tcpLn.Accept()
 				if err != nil {
@@ -362,7 +491,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 				}
 				go handleConn(conn)
 			}
-		}()
+		})
 	}
 
 	handleUDP := func(addr netip.AddrPort, req []byte) {
@@ -373,9 +502,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 	}
 
 	if opts == nil || !opts.SkipUDP {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				buf := make([]byte, 65535)
 				n, addr, err := udpLn.ReadFromUDPAddrPort(buf)
@@ -385,7 +512,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 				buf = buf[:n]
 				go handleUDP(addr, buf)
 			}
-		}()
+		})
 	}
 
 	tb.Cleanup(func() {
@@ -428,22 +555,16 @@ func makeLargeResponse(tb testing.TB, domain string) (request, response []byte) 
 	}
 
 	// Our request is a single A query for the domain in the answer, above.
-	builder = dns.NewBuilder(nil, dns.Header{})
-	builder.StartQuestions()
-	builder.Question(dns.Question{
-		Name:  dns.MustNewName(domain),
-		Type:  dns.TypeA,
-		Class: dns.ClassINET,
-	})
-	request, err = builder.Finish()
-	if err != nil {
-		tb.Fatal(err)
-	}
+	request = makeTestRequest(tb, domain, dns.TypeA, 0)
 
 	return
 }
 
 func runTestQuery(tb testing.TB, request []byte, modify func(*forwarder), ports ...uint16) ([]byte, error) {
+	return runTestQueryWithFamily(tb, request, "udp", modify, ports...)
+}
+
+func runTestQueryWithFamily(tb testing.TB, request []byte, family string, modify func(*forwarder), ports ...uint16) ([]byte, error) {
 	logf := tstest.WhileTestRunningLogger(tb)
 	bus := eventbustest.NewBus(tb)
 	netMon, err := netmon.New(bus, logf)
@@ -467,7 +588,7 @@ func runTestQuery(tb testing.TB, request []byte, modify func(*forwarder), ports 
 
 	rpkt := packet{
 		bs:     request,
-		family: "tcp",
+		family: family,
 		addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
 	}
 
@@ -483,17 +604,29 @@ func runTestQuery(tb testing.TB, request []byte, modify func(*forwarder), ports 
 	}
 }
 
-// makeTestRequest returns a new TypeA request for the given domain.
-func makeTestRequest(tb testing.TB, domain string) []byte {
+// makeTestRequest returns a new DNS request for the given domain.
+// If queryType is 0, it defaults to TypeA. If ednsSize > 0, it adds an EDNS OPT record.
+func makeTestRequest(tb testing.TB, domain string, queryType dns.Type, ednsSize uint16) []byte {
 	tb.Helper()
+	if queryType == 0 {
+		queryType = dns.TypeA
+	}
 	name := dns.MustNewName(domain)
 	builder := dns.NewBuilder(nil, dns.Header{})
 	builder.StartQuestions()
 	builder.Question(dns.Question{
 		Name:  name,
-		Type:  dns.TypeA,
+		Type:  queryType,
 		Class: dns.ClassINET,
 	})
+	if ednsSize > 0 {
+		builder.StartAdditionals()
+		builder.OPTResource(dns.ResourceHeader{
+			Name:  dns.MustNewName("."),
+			Type:  dns.TypeOPT,
+			Class: dns.Class(ednsSize),
+		}, dns.OPTResource{})
+	}
 	request, err := builder.Finish()
 	if err != nil {
 		tb.Fatal(err)
@@ -549,6 +682,359 @@ func beVerbose(f *forwarder) {
 	f.verboseFwd = true
 }
 
+// makeEDNSResponse creates a DNS response of approximately the specified size
+// with TXT records and an OPT record. The response will NOT have the TC flag set
+// (simulating a non-compliant server that doesn't set TC when response exceeds EDNS buffer).
+// The actual size may vary significantly due to DNS packet structure constraints.
+func makeEDNSResponse(tb testing.TB, domain string, targetSize int) []byte {
+	tb.Helper()
+	// Use makeResponseOfSize with includeOPT=true
+	// Allow significant variance since DNS packet sizes are hard to predict exactly
+	// Use a combination of fixed tolerance (200 bytes) and percentage (25%) for larger targets
+	response := makeResponseOfSize(tb, domain, targetSize, true)
+	actualSize := len(response)
+	maxVariance := 200
+	if targetSize > 400 {
+		// For larger targets, allow 25% variance
+		maxVariance = targetSize * 25 / 100
+	}
+	if actualSize < targetSize-maxVariance || actualSize > targetSize+maxVariance {
+		tb.Fatalf("response size = %d, want approximately %d (variance: %d, allowed: ±%d)",
+			actualSize, targetSize, actualSize-targetSize, maxVariance)
+	}
+	return response
+}
+
+func TestEDNSBufferSizeTruncation(t *testing.T) {
+	const domain = "edns-test.example.com."
+	const ednsBufferSize = 500 // Small EDNS buffer
+	const responseSize = 800   // Response exceeds EDNS but < maxResponseBytes
+
+	// Create a response that exceeds EDNS buffer size but doesn't have TC flag set
+	response := makeEDNSResponse(t, domain, responseSize)
+
+	// Create a request with EDNS buffer size
+	request := makeTestRequest(t, domain, dns.TypeTXT, ednsBufferSize)
+	verifyEDNSBufferSize(t, request, ednsBufferSize)
+
+	// Verify response doesn't have TC flag set initially
+	if truncatedFlagSet(response) {
+		t.Fatal("test response should not have TC flag set initially")
+	}
+
+	// Set up test DNS server
+	port := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {
+		verifyEDNSBufferSize(t, gotRequest, ednsBufferSize)
+	})
+
+	// Disable TCP retries to ensure we test UDP path
+	resp := mustRunTestQuery(t, request, setupForwarderWithTCPRetriesDisabled(), port)
+
+	// Verify the response has TC flag set by forwarder
+	if !truncatedFlagSet(resp) {
+		t.Errorf("TC flag not set in response (response size=%d, EDNS=%d)", len(resp), ednsBufferSize)
+	}
+
+	// Verify response size is preserved (not truncated by buffer)
+	if len(resp) != len(response) {
+		t.Errorf("response size = %d, want %d (response should not be truncated by buffer)", len(resp), len(response))
+	}
+
+	// Verify response size exceeds EDNS buffer
+	if len(resp) <= int(ednsBufferSize) {
+		t.Errorf("response size = %d, should exceed EDNS buffer size %d", len(resp), ednsBufferSize)
+	}
+}
+
+// makeResponseOfSize creates a DNS response of approximately the specified size
+// with TXT records. The response will NOT have the TC flag set initially.
+// If includeOPT is true, an OPT record is added to the response.
+func makeResponseOfSize(tb testing.TB, domain string, targetSize int, includeOPT bool) []byte {
+	tb.Helper()
+	name := dns.MustNewName(domain)
+
+	// Estimate how many TXT records we need
+	// Each TXT record with ~200 bytes of data adds roughly 220-230 bytes to the packet
+	// (including DNS headers, name compression, etc.)
+	bytesPerRecord := 220
+	baseSize := 50 // Approximate base packet size (header + question)
+	if includeOPT {
+		baseSize += 11 // OPT record adds ~11 bytes
+	}
+	estimatedRecords := max((targetSize-baseSize)/bytesPerRecord, 1)
+
+	// Start with estimated records and adjust
+	txtLen := 200
+	var response []byte
+	var err error
+
+	for range 10 {
+		testBuilder := dns.NewBuilder(nil, dns.Header{
+			Response:      true,
+			Authoritative: true,
+			RCode:         dns.RCodeSuccess,
+		})
+		testBuilder.StartQuestions()
+		testBuilder.Question(dns.Question{
+			Name:  name,
+			Type:  dns.TypeTXT,
+			Class: dns.ClassINET,
+		})
+		testBuilder.StartAnswers()
+
+		for i := 0; i < estimatedRecords; i++ {
+			txtValue := strings.Repeat("x", txtLen)
+			testBuilder.TXTResource(dns.ResourceHeader{
+				Name:  name,
+				Type:  dns.TypeTXT,
+				Class: dns.ClassINET,
+				TTL:   300,
+			}, dns.TXTResource{
+				TXT: []string{txtValue},
+			})
+		}
+
+		// Optionally add OPT record
+		if includeOPT {
+			testBuilder.StartAdditionals()
+			testBuilder.OPTResource(dns.ResourceHeader{
+				Name:  dns.MustNewName("."),
+				Type:  dns.TypeOPT,
+				Class: dns.Class(4096),
+			}, dns.OPTResource{})
+		}
+
+		response, err = testBuilder.Finish()
+		if err != nil {
+			tb.Fatal(err)
+		}
+
+		actualSize := len(response)
+		// Stop if we've reached or slightly exceeded the target
+		// Allow up to 20% overshoot to avoid excessive iterations
+		if actualSize >= targetSize && actualSize <= targetSize*120/100 {
+			break
+		}
+		// If we've overshot significantly, we're done (better than undershooting)
+		if actualSize > targetSize*120/100 {
+			break
+		}
+
+		// Adjust for next attempt
+		needed := targetSize - actualSize
+		additionalRecords := (needed / bytesPerRecord) + 1
+		estimatedRecords += additionalRecords
+		if estimatedRecords > 200 {
+			// If we need too many records, increase TXT length instead
+			txtLen = 255         // Max single TXT string length
+			bytesPerRecord = 280 // Adjusted estimate
+			estimatedRecords = max((targetSize-baseSize)/bytesPerRecord, 1)
+		}
+	}
+
+	// Ensure TC flag is NOT set initially
+	clearTCFlagInPacket(response)
+
+	return response
+}
+
+func TestCheckResponseSizeAndSetTC(t *testing.T) {
+	const domain = "test.example.com."
+	logf := func(format string, args ...any) {
+		// Silent logger for tests
+	}
+
+	tests := []struct {
+		name           string
+		responseSize   int
+		requestHasEDNS bool
+		ednsSize       uint16
+		family         string
+		responseTCSet  bool // Whether response has TC flag set initially
+		wantTCSet      bool // Whether TC flag should be set after function call
+		skipIfNotExact bool // Skip test if we can't hit exact size (for edge cases)
+	}{
+		// Default UDP size (512 bytes) without EDNS
+		{
+			name:           "UDP_noEDNS_small_should_not_set_TC",
+			responseSize:   400,
+			requestHasEDNS: false,
+			family:         "udp",
+			wantTCSet:      false,
+		},
+		{
+			name:           "UDP_noEDNS_512bytes_should_not_set_TC",
+			responseSize:   512,
+			requestHasEDNS: false,
+			family:         "udp",
+			wantTCSet:      false,
+			skipIfNotExact: true,
+		},
+		{
+			name:           "UDP_noEDNS_513bytes_should_set_TC",
+			responseSize:   513,
+			requestHasEDNS: false,
+			family:         "udp",
+			wantTCSet:      true,
+			skipIfNotExact: true,
+		},
+		{
+			name:           "UDP_noEDNS_large_should_set_TC",
+			responseSize:   600,
+			requestHasEDNS: false,
+			family:         "udp",
+			wantTCSet:      true,
+		},
+
+		// EDNS edge cases
+		{
+			name:           "UDP_EDNS_small_under_limit_should_not_set_TC",
+			responseSize:   450,
+			requestHasEDNS: true,
+			ednsSize:       500,
+			family:         "udp",
+			wantTCSet:      false,
+		},
+		{
+			name:           "UDP_EDNS_at_limit_should_not_set_TC",
+			responseSize:   500,
+			requestHasEDNS: true,
+			ednsSize:       500,
+			family:         "udp",
+			wantTCSet:      false,
+		},
+		{
+			name:           "UDP_EDNS_over_limit_should_set_TC",
+			responseSize:   550,
+			requestHasEDNS: true,
+			ednsSize:       500,
+			family:         "udp",
+			wantTCSet:      true,
+		},
+		{
+			name:           "UDP_EDNS_large_over_limit_should_set_TC",
+			responseSize:   1500,
+			requestHasEDNS: true,
+			ednsSize:       1200,
+			family:         "udp",
+			wantTCSet:      true,
+		},
+
+		// Early return paths
+		{
+			name:         "TCP_query_should_skip",
+			responseSize: 1000,
+			family:       "tcp",
+			wantTCSet:    false,
+		},
+		{
+			name:         "response_too_small_should_skip",
+			responseSize: headerBytes - 1,
+			family:       "udp",
+			wantTCSet:    false,
+		},
+		{
+			name:         "response_exactly_headerBytes_should_not_set_TC",
+			responseSize: headerBytes,
+			family:       "udp",
+			wantTCSet:    false,
+		},
+		{
+			name:          "response_TC_already_set_should_skip",
+			responseSize:  600,
+			family:        "udp",
+			responseTCSet: true,
+			wantTCSet:     true, // Should remain set
+		},
+		{
+			name:           "UDP_noEDNS_large_TC_already_set_should_skip",
+			responseSize:   600,
+			requestHasEDNS: false,
+			family:         "udp",
+			responseTCSet:  true,
+			wantTCSet:      true, // Should remain set
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var response []byte
+
+			// Create response of specified size
+			if tt.responseSize < headerBytes {
+				// For too-small test, create minimal invalid packet
+				response = make([]byte, tt.responseSize)
+				// Don't set any flags, just make it too small
+			} else {
+				response = makeResponseOfSize(t, domain, tt.responseSize, false)
+				actualSize := len(response)
+
+				// Only adjust expectations for UDP queries that go through size checking
+				// TCP queries and other early-return cases should keep their original expectations
+				if tt.family == "udp" && !tt.responseTCSet && actualSize >= headerBytes {
+					// Determine the maximum allowed size based on request
+					var maxSize int
+					if tt.requestHasEDNS {
+						maxSize = int(tt.ednsSize)
+					} else {
+						maxSize = 512 // default UDP size per RFC 1035
+					}
+
+					// For edge cases where exact size matters, verify we're close enough
+					if tt.skipIfNotExact {
+						// For 512/513 byte tests, we need to be very close
+						if actualSize < tt.responseSize-10 || actualSize > tt.responseSize+10 {
+							t.Skipf("skipping: could not create response close to target size %d (got %d)", tt.responseSize, actualSize)
+						}
+						// Function sets TC if response > maxSize, so adjust expectation based on actual size
+						tt.wantTCSet = actualSize > maxSize
+					} else {
+						// For non-exact tests, adjust expectation based on actual response size
+						// The function sets TC if actualSize > maxSize
+						tt.wantTCSet = actualSize > maxSize
+					}
+				}
+			}
+
+			// Set TC flag initially if requested
+			if tt.responseTCSet {
+				setTCFlagInPacket(response)
+			}
+
+			// Create request with or without EDNS
+			var ednsSize uint16
+			if tt.requestHasEDNS {
+				ednsSize = tt.ednsSize
+			}
+			request := makeTestRequest(t, domain, dns.TypeTXT, ednsSize)
+
+			// Call the function
+			result := checkResponseSizeAndSetTC(response, request, tt.family, logf)
+
+			// Verify response size is preserved (function should not truncate, only set flag)
+			if len(result) != len(response) {
+				t.Errorf("response size changed: got %d, want %d", len(result), len(response))
+			}
+
+			// Verify TC flag state
+			if len(result) >= headerBytes {
+				hasTC := truncatedFlagSet(result)
+				if hasTC != tt.wantTCSet {
+					t.Errorf("TC flag: got %v, want %v (response size=%d)", hasTC, tt.wantTCSet, len(result))
+				}
+			} else if tt.responseSize >= headerBytes {
+				// If we expected a valid response but got too small, that's unexpected
+				t.Errorf("response too small (%d bytes) but expected valid response", len(result))
+			}
+
+			// Verify response pointer is same (should be in-place modification)
+			if &result[0] != &response[0] {
+				t.Errorf("function should modify response in place, but got new slice")
+			}
+		})
+	}
+}
+
 func TestForwarderTCPFallback(t *testing.T) {
 	const domain = "large-dns-response.tailscale.com."
 
@@ -569,7 +1055,10 @@ func TestForwarderTCPFallback(t *testing.T) {
 		}
 	})
 
-	resp := mustRunTestQuery(t, request, beVerbose, port)
+	resp, err := runTestQueryWithFamily(t, request, "tcp", beVerbose, port)
+	if err != nil {
+		t.Fatalf("error making request: %v", err)
+	}
 	if !bytes.Equal(resp, largeResponse) {
 		t.Errorf("invalid response\ngot: %+v\nwant: %+v", resp, largeResponse)
 	}
@@ -636,17 +1125,13 @@ func TestForwarderTCPFallbackDisabled(t *testing.T) {
 
 	resp := mustRunTestQuery(t, request, func(fwd *forwarder) {
 		fwd.verboseFwd = true
-		// Disable retries for this test.
-		fwd.controlKnobs = &controlknobs.Knobs{}
-		fwd.controlKnobs.DisableDNSForwarderTCPRetries.Store(true)
+		setupForwarderWithTCPRetriesDisabled()(fwd)
 	}, port)
 
 	wantResp := append([]byte(nil), largeResponse[:maxResponseBytes]...)
 
 	// Set the truncated flag on the expected response, since that's what we expect.
-	flags := binary.BigEndian.Uint16(wantResp[2:4])
-	flags |= dnsFlagTruncated
-	binary.BigEndian.PutUint16(wantResp[2:4], flags)
+	setTCFlagInPacket(wantResp)
 
 	if !bytes.Equal(resp, wantResp) {
 		t.Errorf("invalid response\ngot (%d): %+v\nwant (%d): %+v", len(resp), resp, len(wantResp), wantResp)
@@ -664,7 +1149,7 @@ func TestForwarderTCPFallbackError(t *testing.T) {
 	response := makeTestResponse(t, domain, dns.RCodeServerFailure)
 
 	// Our request is a single A query for the domain in the answer, above.
-	request := makeTestRequest(t, domain)
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
 
 	var sawRequest atomic.Bool
 	port := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {
@@ -695,7 +1180,7 @@ func TestForwarderTCPFallbackError(t *testing.T) {
 // returns a successful response, we propagate it.
 func TestForwarderWithManyResolvers(t *testing.T) {
 	const domain = "example.com."
-	request := makeTestRequest(t, domain)
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
 
 	tests := []struct {
 		name          string
@@ -727,7 +1212,7 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 			},
 		},
 		{
-			name: "ServFail+Success",
+			name: "ServFail-and-Success",
 			responses: [][]byte{ // All upstream servers fail except for one.
 				makeTestResponse(t, domain, dns.RCodeServerFailure),
 				makeTestResponse(t, domain, dns.RCodeServerFailure),
@@ -750,7 +1235,7 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 			},
 		},
 		{
-			name: "NXDomain+Success",
+			name: "NXDomain-and-Success",
 			responses: [][]byte{ // All upstream servers returned NXDOMAIN except for one.
 				makeTestResponse(t, domain, dns.RCodeNameError),
 				makeTestResponse(t, domain, dns.RCodeNameError),
@@ -762,8 +1247,19 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 			},
 		},
 		{
-			name: "Refused",
-			responses: [][]byte{ // All upstream servers return different failures.
+			name: "AllRefused",
+			responses: [][]byte{ // All upstream servers return REFUSED.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+			wantResponses: [][]byte{ // When all refuse, return REFUSED to the client.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+		},
+		{
+			name: "Refused-and-Success",
+			responses: [][]byte{ // Some upstream servers refuse, but one succeeds.
 				makeTestResponse(t, domain, dns.RCodeRefused),
 				makeTestResponse(t, domain, dns.RCodeRefused),
 				makeTestResponse(t, domain, dns.RCodeRefused),
@@ -771,21 +1267,30 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 				makeTestResponse(t, domain, dns.RCodeRefused),
 				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
 			},
-			wantResponses: [][]byte{ // Refused is not considered to be an error and can be forwarded.
-				makeTestResponse(t, domain, dns.RCodeRefused),
+			wantResponses: [][]byte{ // Refused is treated as a soft error; the Success response should win.
 				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
 			},
 		},
 		{
+			name: "Refused-and-ServFail",
+			responses: [][]byte{ // Some servers refuse, at least one fails.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+			wantResponses: [][]byte{ // Any non-REFUSED failure triggers SERVFAIL regardless of arrival order.
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+			},
+		},
+		{
 			name: "MixFail",
-			responses: [][]byte{ // All upstream servers return different failures.
+			responses: [][]byte{ // Upstream servers return different failures.
 				makeTestResponse(t, domain, dns.RCodeServerFailure),
 				makeTestResponse(t, domain, dns.RCodeNameError),
 				makeTestResponse(t, domain, dns.RCodeRefused),
 			},
-			wantResponses: [][]byte{ // Both NXDomain and Refused can be forwarded.
+			wantResponses: [][]byte{ // SERVFAIL and REFUSED are soft errors; NXDOMAIN wins.
 				makeTestResponse(t, domain, dns.RCodeNameError),
-				makeTestResponse(t, domain, dns.RCodeRefused),
 			},
 		},
 	}
@@ -837,20 +1342,7 @@ func TestNXDOMAINIncludesQuestion(t *testing.T) {
 	}()
 
 	// Our request is a single PTR query for the domain in the answer, above.
-	request := func() []byte {
-		builder := dns.NewBuilder(nil, dns.Header{})
-		builder.StartQuestions()
-		builder.Question(dns.Question{
-			Name:  dns.MustNewName(domain),
-			Type:  dns.TypePTR,
-			Class: dns.ClassINET,
-		})
-		request, err := builder.Finish()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return request
-	}()
+	request := makeTestRequest(t, domain, dns.TypePTR, 0)
 
 	port := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {
 	})
@@ -862,5 +1354,304 @@ func TestNXDOMAINIncludesQuestion(t *testing.T) {
 
 	if !slices.Equal(res, response) {
 		t.Errorf("invalid response\ngot: %+v\nwant: %+v", res, response)
+	}
+}
+
+func TestForwarderVerboseLogs(t *testing.T) {
+	const domain = "test.tailscale.com."
+	response := makeTestResponse(t, domain, dns.RCodeServerFailure)
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+
+	port := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {
+		if !bytes.Equal(request, gotRequest) {
+			t.Errorf("invalid request\ngot: %+v\nwant: %+v", gotRequest, request)
+		}
+	})
+
+	var (
+		mu     sync.Mutex // protects following
+		done   bool
+		logBuf bytes.Buffer
+	)
+	fwdLogf := func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if done {
+			return // no logging after test is done
+		}
+
+		t.Logf("[forwarder] "+format, args...)
+		fmt.Fprintf(&logBuf, format+"\n", args...)
+	}
+	t.Cleanup(func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	})
+
+	_, err := runTestQuery(t, request, func(f *forwarder) {
+		f.logf = fwdLogf
+		f.verboseFwd = true
+	}, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logStr := logBuf.String()
+	if !strings.Contains(logStr, "forwarder.send(") {
+		t.Errorf("expected forwarding log, got:\n%s", logStr)
+	}
+}
+
+// TestForwarderHealthOnContextExpiry verifies that when all resolvers fail and
+// the context expires before the response can be sent, the health tracker is
+// set unhealthy if and only if acceptDNS is true.
+func TestForwarderHealthOnContextExpiry(t *testing.T) {
+	const domain = "health-test.example.com."
+
+	tests := []struct {
+		name          string
+		acceptDNS     bool
+		wantUnhealthy bool
+	}{
+		{"acceptDNS=true", true, true},
+		{"acceptDNS=false", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := makeTestRequest(t, domain, dns.TypeA, 0)
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			ht := health.NewTracker(bus)
+			fwd := newForwarder(logf, netMon, nil, &dialer, ht, nil)
+			fwd.acceptDNS = tt.acceptDNS
+
+			port1 := runDNSServer(t, nil, makeTestResponse(t, domain, dns.RCodeServerFailure), func(bool, []byte) {})
+			port2 := runDNSServer(t, nil, makeTestResponse(t, domain, dns.RCodeServerFailure), func(bool, []byte) {})
+
+			resolvers := []resolverAndDelay{
+				{name: &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", port1)}},
+				{name: &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", port2)}},
+			}
+
+			rpkt := packet{
+				bs:     request,
+				family: "udp",
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+
+			// Use an unbuffered responseChan so the send blocks, forcing the
+			// ctx.Done path and the SetUnhealthy call.
+			responseChan := make(chan packet)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			// Cancel after DNS servers have had time to respond and their errors
+			// collected, leaving forwardWithDestChan blocked on responseChan.
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				cancel()
+			}()
+
+			fwd.forwardWithDestChan(ctx, rpkt, responseChan, resolvers...)
+
+			if got := ht.IsUnhealthy(dnsForwarderFailing); got != tt.wantUnhealthy {
+				t.Errorf("IsUnhealthy = %v, want %v", got, tt.wantUnhealthy)
+			}
+		})
+	}
+}
+
+// TestForwarderHealthNoUpstreamResolvers verifies that a query with no upstream
+// resolver never raises dnsForwarderFailing, regardless of acceptDNS; that
+// warning is reserved for resolvers we found but couldn't reach (see
+// TestForwarderHealthOnContextExpiry). See tailscale/tailscale#19931.
+func TestForwarderHealthNoUpstreamResolvers(t *testing.T) {
+	const domain = "no-resolver.example.com."
+
+	for _, acceptDNS := range []bool{true, false} {
+		t.Run(fmt.Sprintf("acceptDNS=%v", acceptDNS), func(t *testing.T) {
+			request := makeTestRequest(t, domain, dns.TypeA, 0)
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			ht := health.NewTracker(bus)
+			fwd := newForwarder(logf, netMon, nil, &dialer, ht, nil)
+			fwd.acceptDNS = acceptDNS
+			// No routes are configured, so the forwarder has no upstream
+			// resolver for the query and returns SERVFAIL.
+
+			rpkt := packet{
+				bs:     request,
+				family: "udp",
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+			// Buffered so the SERVFAIL response can be sent without a reader.
+			responseChan := make(chan packet, 1)
+
+			if err := fwd.forwardWithDestChan(context.Background(), rpkt, responseChan); err != nil {
+				t.Fatalf("forwardWithDestChan: %v", err)
+			}
+
+			if ht.IsUnhealthy(dnsForwarderFailing) {
+				t.Error("dnsForwarderFailing was raised for a query with no upstream resolver; want healthy")
+			}
+		})
+	}
+}
+
+func TestResolversCustomScheme(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		domain    dnsname.FQDN
+		schemes   map[string]CustomSchemeHandler
+		routes    map[dnsname.FQDN][]*dnstype.Resolver
+		wantAddrs []string
+	}{
+		{
+			name:    "no-custom-scheme",
+			domain:  "example.com.",
+			schemes: map[string]CustomSchemeHandler{},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "192.168.1.2:53"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53", "192.168.1.2:53"},
+		},
+		{
+			name:   "single-custom-scheme",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "1.2.3.4:53", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {{Addr: "myscheme:customKey"}},
+			},
+			wantAddrs: []string{"1.2.3.4:53"},
+		},
+		{
+			name:   "with-other-resolvers",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(key string) (string, error) { return "1.2.3.4:53", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "myscheme:customKey"},
+					{Addr: "192.168.1.2:53"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53", "1.2.3.4:53", "192.168.1.2:53"},
+		},
+		{
+			name:   "multiple-custom-schemes",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"schemeOne": func(string) (string, error) { return "1.2.3.4:53", nil },
+				"schemeTwo": func(string) (string, error) { return "5.6.7.8:53", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "schemeOne:customKey"},
+					{Addr: "schemeTwo:customKey"},
+				},
+			},
+			wantAddrs: []string{"1.2.3.4:53", "5.6.7.8:53"},
+		},
+		{
+			name:   "empty-string-means-no-resolver",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "myscheme:customKey"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53"},
+		},
+		{
+			name:   "error-means-no-resolver",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "", fmt.Errorf("handler error") },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "myscheme:customKey"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53"},
+		},
+		{
+			// If the best-matching route yields no resolvers after scheme
+			// resolution, fall through to the next matching route.
+			name:   "empty-scheme-result-falls-through-to-next-matching-route",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {{Addr: "myscheme:customKey"}},
+				".":            {{Addr: "192.168.1.1:53"}},
+			},
+			wantAddrs: []string{"192.168.1.1:53"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			fwd := newForwarder(logf, netMon, nil, &dialer, health.NewTracker(bus), nil)
+			for scheme, handler := range tt.schemes {
+				if err := fwd.RegisterCustomScheme(scheme, handler); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			fwd.setRoutes(tt.routes, false)
+
+			got := fwd.resolvers(tt.domain)
+			var gotAddrs []string
+			for _, r := range got {
+				gotAddrs = append(gotAddrs, r.name.Addr)
+			}
+			if !slices.Equal(gotAddrs, tt.wantAddrs) {
+				t.Errorf("got %v, want %v", gotAddrs, tt.wantAddrs)
+			}
+		})
 	}
 }

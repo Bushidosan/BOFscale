@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
@@ -6,7 +6,17 @@ package tstest
 import (
 	"runtime"
 	"testing"
+
+	"tailscale.com/tstest/deptest"
 )
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		BadDeps: map[string]string{
+			"testing": "do not link the testing package and its flag side effects into non-test binaries; use testenv.TB",
+		},
+	}.Check(t)
+}
 
 func TestReplace(t *testing.T) {
 	before := "before"

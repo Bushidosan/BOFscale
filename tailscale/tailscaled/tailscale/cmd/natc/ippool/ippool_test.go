@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ippool
@@ -30,7 +30,7 @@ func TestIPPoolExhaustion(t *testing.T) {
 
 	from := tailcfg.NodeID(12345)
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		for _, domain := range domains {
 			addr, err := pool.IPForDomain(from, domain)
 			if err != nil {

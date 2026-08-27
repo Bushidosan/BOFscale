@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_aws
@@ -79,7 +79,7 @@ type awsStore struct {
 //
 // Note that we store the entire store in a single parameter
 // key, therefore if the state is above 8kb, it can cause
-// Tailscaled to only only store new state in-memory and
+// Tailscaled to only store new state in-memory and
 // restarting Tailscaled can fail until you delete your state
 // from the AWS Parameter Store.
 //
@@ -189,8 +189,7 @@ func (s *awsStore) LoadState() error {
 	)
 
 	if err != nil {
-		var pnf *ssmTypes.ParameterNotFound
-		if errors.As(err, &pnf) {
+		if _, ok := errors.AsType[*ssmTypes.ParameterNotFound](err); ok {
 			// Create the parameter as it does not exist yet
 			// and return directly as it is defacto empty
 			return s.persistState()

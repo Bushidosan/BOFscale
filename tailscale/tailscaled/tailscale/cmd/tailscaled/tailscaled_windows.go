@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build go1.19
@@ -45,7 +45,6 @@ import (
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
 	_ "tailscale.com/ipn/auditlog"
-	_ "tailscale.com/ipn/desktop"
 	"tailscale.com/logpolicy"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"

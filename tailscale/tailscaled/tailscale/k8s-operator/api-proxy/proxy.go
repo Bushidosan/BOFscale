@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pires/go-proxyproto"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/endpoints/request"
@@ -28,9 +29,9 @@ import (
 	"k8s.io/client-go/transport"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/envknob"
 	ksr "tailscale.com/k8s-operator/sessionrecording"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/netx"
 	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
@@ -64,7 +65,7 @@ func NewAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, ts *tsn
 		return nil, fmt.Errorf("could not get rest.TransportConfig(): %w", err)
 	}
 
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := netutil.NewDefaultTransport()
 	tr.TLSClientConfig, err = transport.TLSConfigFor(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("could not get transport.TLSConfigFor(): %w", err)
@@ -97,7 +98,6 @@ func NewAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, ts *tsn
 		upstreamURL:   u,
 		ts:            ts,
 		sendEventFunc: sessionrecording.SendEvent,
-		eventsEnabled: envknob.Bool("TS_EXPERIMENTAL_KUBE_API_EVENTS"),
 	}
 	ap.rp = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -152,9 +152,17 @@ func (ap *APIServerProxy) Run(ctx context.Context) error {
 		}
 	} else {
 		var err error
-		proxyLn, err = net.Listen("tcp", "localhost:80")
+		baseLn, err := net.Listen("tcp", "localhost:80")
 		if err != nil {
 			return fmt.Errorf("could not listen on :80: %w", err)
+		}
+		proxyLn = &proxyproto.Listener{
+			Listener:          baseLn,
+			ReadHeaderTimeout: 10 * time.Second,
+			ConnPolicy: proxyproto.ConnPolicyFunc(func(opts proxyproto.ConnPolicyOptions) (proxyproto.Policy,
+				error) {
+				return proxyproto.REQUIRE, nil
+			}),
 		}
 		serve = ap.hs.Serve
 	}
@@ -194,9 +202,6 @@ type APIServerProxy struct {
 	upstreamURL *url.URL
 
 	sendEventFunc func(ap netip.AddrPort, event io.Reader, dial netx.DialFunc) error
-
-	// Flag used to enable sending API requests as events to tsrecorder.
-	eventsEnabled bool
 }
 
 // serveDefault is the default handler for Kubernetes API server requests.
@@ -207,11 +212,31 @@ func (ap *APIServerProxy) serveDefault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err = ap.recordRequestAsEvent(r, who); err != nil {
-		msg := fmt.Sprintf("error recording Kubernetes API request: %v", err)
-		ap.log.Errorf(msg)
-		http.Error(w, msg, http.StatusBadGateway)
+	c, err := determineRecorderConfig(who)
+	if err != nil {
+		ap.log.Errorf("error trying to determine whether the kubernetes api request %q needs to be recorded: %v", r.URL.String(), err)
 		return
+	}
+
+	if c.failOpen && len(c.recorderAddresses) == 0 { // will not record
+		ap.rp.ServeHTTP(w, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
+		return
+	}
+	ksr.CounterKubernetesAPIRequestEventsAttempted.Add(1) // at this point we know that users intended for this request to be recorded
+	if !c.failOpen && len(c.recorderAddresses) == 0 {
+		msg := fmt.Sprintf("forbidden: api request %q must be recorded, but no recorders are available.", r.URL.String())
+		ap.log.Error(msg)
+		http.Error(w, msg, http.StatusForbidden)
+		return
+	}
+
+	if c.enableEvents {
+		if err = ap.recordRequestAsEvent(r, who, c.recorderAddresses, c.failOpen); err != nil {
+			msg := fmt.Sprintf("error recording Kubernetes API request: %v", err)
+			ap.log.Errorf(msg)
+			http.Error(w, msg, http.StatusBadGateway)
+			return
+		}
 	}
 
 	counterNumRequestsProxied.Add(1)
@@ -256,35 +281,40 @@ func (ap *APIServerProxy) sessionForProto(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err = ap.recordRequestAsEvent(r, who); err != nil {
-		msg := fmt.Sprintf("error recording Kubernetes API request: %v", err)
-		ap.log.Errorf(msg)
-		http.Error(w, msg, http.StatusBadGateway)
-		return
-	}
-
 	counterNumRequestsProxied.Add(1)
-	failOpen, addrs, err := determineRecorderConfig(who)
+	c, err := determineRecorderConfig(who)
 	if err != nil {
 		ap.log.Errorf("error trying to determine whether the 'kubectl %s' session needs to be recorded: %v", sessionType, err)
 		return
 	}
-	if failOpen && len(addrs) == 0 { // will not record
+
+	if c.failOpen && len(c.recorderAddresses) == 0 { // will not record
 		ap.rp.ServeHTTP(w, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
 		return
 	}
-	ksr.CounterSessionRecordingsAttempted.Add(1) // at this point we know that users intended for this session to be recorded
-	if !failOpen && len(addrs) == 0 {
+	ksr.CounterKubernetesAPIRequestEventsAttempted.Add(1) // at this point we know that users intended for this request to be recorded
+	if !c.failOpen && len(c.recorderAddresses) == 0 {
 		msg := fmt.Sprintf("forbidden: 'kubectl %s' session must be recorded, but no recorders are available.", sessionType)
 		ap.log.Error(msg)
 		http.Error(w, msg, http.StatusForbidden)
 		return
 	}
 
+	if c.enableEvents {
+		if err = ap.recordRequestAsEvent(r, who, c.recorderAddresses, c.failOpen); err != nil {
+			msg := fmt.Sprintf("error recording Kubernetes API request: %v", err)
+			ap.log.Errorf(msg)
+			http.Error(w, msg, http.StatusBadGateway)
+			return
+		}
+	}
+
+	ksr.CounterSessionRecordingsAttempted.Add(1) // at this point we know that users intended for this session to be recorded
+
 	wantsHeader := upgradeHeaderForProto[proto]
 	if h := r.Header.Get(upgradeHeaderKey); h != wantsHeader {
 		msg := fmt.Sprintf("[unexpected] unable to verify that streaming protocol is %s, wants Upgrade header %q, got: %q", proto, wantsHeader, h)
-		if failOpen {
+		if c.failOpen {
 			msg = msg + "; failure mode is 'fail open'; continuing session without recording."
 			ap.log.Warn(msg)
 			ap.rp.ServeHTTP(w, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
@@ -303,8 +333,8 @@ func (ap *APIServerProxy) sessionForProto(w http.ResponseWriter, r *http.Request
 		SessionType: sessionType,
 		TS:          ap.ts,
 		Who:         who,
-		Addrs:       addrs,
-		FailOpen:    failOpen,
+		Addrs:       c.recorderAddresses,
+		FailOpen:    c.failOpen,
 		Pod:         r.PathValue(podNameKey),
 		Namespace:   r.PathValue(namespaceNameKey),
 		Log:         ap.log,
@@ -314,21 +344,9 @@ func (ap *APIServerProxy) sessionForProto(w http.ResponseWriter, r *http.Request
 	ap.rp.ServeHTTP(h, r.WithContext(whoIsKey.WithValue(r.Context(), who)))
 }
 
-func (ap *APIServerProxy) recordRequestAsEvent(req *http.Request, who *apitype.WhoIsResponse) error {
-	if !ap.eventsEnabled {
-		return nil
-	}
-
-	failOpen, addrs, err := determineRecorderConfig(who)
-	if err != nil {
-		return fmt.Errorf("error trying to determine whether the kubernetes api request needs to be recorded: %w", err)
-	}
+func (ap *APIServerProxy) recordRequestAsEvent(req *http.Request, who *apitype.WhoIsResponse, addrs []netip.AddrPort, failOpen bool) error {
 	if len(addrs) == 0 {
-		if failOpen {
-			return nil
-		} else {
-			return fmt.Errorf("forbidden: kubernetes api request must be recorded, but no recorders are available")
-		}
+		return fmt.Errorf("no recorder addresses specified")
 	}
 
 	factory := &request.RequestInfoFactory{
@@ -537,20 +555,28 @@ func addImpersonationHeaders(r *http.Request, log *zap.SugaredLogger) error {
 	return nil
 }
 
+type recorderConfig struct {
+	failOpen          bool
+	enableEvents      bool
+	recorderAddresses []netip.AddrPort
+}
+
 // determineRecorderConfig determines recorder config from requester's peer
 // capabilities. Determines whether a 'kubectl exec' session from this requester
 // needs to be recorded and what recorders the recording should be sent to.
-func determineRecorderConfig(who *apitype.WhoIsResponse) (failOpen bool, recorderAddresses []netip.AddrPort, _ error) {
+func determineRecorderConfig(who *apitype.WhoIsResponse) (c recorderConfig, _ error) {
 	if who == nil {
-		return false, nil, errors.New("[unexpected] cannot determine caller")
+		return c, errors.New("[unexpected] cannot determine caller")
 	}
-	failOpen = true
+
+	c.failOpen = true
+	c.enableEvents = false
 	rules, err := tailcfg.UnmarshalCapJSON[kubetypes.KubernetesCapRule](who.CapMap, tailcfg.PeerCapabilityKubernetes)
 	if err != nil {
-		return failOpen, nil, fmt.Errorf("failed to unmarshal Kubernetes capability: %w", err)
+		return c, fmt.Errorf("failed to unmarshal Kubernetes capability: %w", err)
 	}
 	if len(rules) == 0 {
-		return failOpen, nil, nil
+		return c, nil
 	}
 
 	for _, rule := range rules {
@@ -559,13 +585,16 @@ func determineRecorderConfig(who *apitype.WhoIsResponse) (failOpen bool, recorde
 			// recorders behind those addrs are online - else we
 			// spend 30s trying to reach a recorder whose tailscale
 			// status is offline.
-			recorderAddresses = append(recorderAddresses, rule.RecorderAddrs...)
+			c.recorderAddresses = append(c.recorderAddresses, rule.RecorderAddrs...)
 		}
 		if rule.EnforceRecorder {
-			failOpen = false
+			c.failOpen = false
+		}
+		if rule.EnableEvents {
+			c.enableEvents = true
 		}
 	}
-	return failOpen, recorderAddresses, nil
+	return c, nil
 }
 
 var upgradeHeaderForProto = map[ksr.Protocol]string{

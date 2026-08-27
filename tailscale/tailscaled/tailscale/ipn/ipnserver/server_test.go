@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnserver_test
@@ -16,7 +16,6 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/lapitest"
 	"tailscale.com/tsd"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/policytest"
 )
@@ -49,7 +48,7 @@ func TestUserConnectDisconnectNonWindows(t *testing.T) {
 
 	// And if we send a notification, both users should receive it.
 	wantErrMessage := "test error"
-	testNotify := ipn.Notify{ErrMessage: ptr.To(wantErrMessage)}
+	testNotify := ipn.Notify{ErrMessage: new(wantErrMessage)}
 	server.Backend().DebugNotify(testNotify)
 
 	if n, err := watcherA.Next(); err != nil {
@@ -156,7 +155,7 @@ func TestConcurrentOSUserSwitchingOnWindows(t *testing.T) {
 
 		// Get the current user from the LocalBackend's perspective
 		// as soon as we're connected.
-		gotUID, gotActor := server.Backend().CurrentUserForTest()
+		gotUID, gotActor := server.Backend().ForTest().CurrentUser()
 
 		// Wait for the first notification to arrive.
 		// It will either be the initial state we've requested via [ipn.NotifyInitialState],
@@ -274,12 +273,12 @@ func TestShutdownViaLocalAPI(t *testing.T) {
 		},
 		{
 			name:                   "AllowTailscaledRestart/False",
-			allowTailscaledRestart: ptr.To(false),
+			allowTailscaledRestart: new(false),
 			wantErr:                errAccessDeniedByPolicy,
 		},
 		{
 			name:                   "AllowTailscaledRestart/True",
-			allowTailscaledRestart: ptr.To(true),
+			allowTailscaledRestart: new(true),
 			wantErr:                nil, // shutdown should be allowed
 		},
 	}

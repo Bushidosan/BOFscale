@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package auditlog
@@ -33,11 +33,10 @@ func SetStoreFilePath(path string) {
 func DefaultStoreFilePath() (string, error) {
 	switch runtime.GOOS {
 	case "windows":
-		if buildfeatures.HasLogTail {
-			return filepath.Join(os.Getenv("ProgramData"), "Tailscale", "audit-log.json"), nil
-		} else {
+		if !buildfeatures.HasLogTail {
 			return "mem:auditlog", nil
 		}
+		return filepath.Join(os.Getenv("ProgramData"), "Tailscale", "audit-log.json"), nil
 	default:
 		// The auditlog package must either be omitted from the build,
 		// have the platform-specific store path set with [SetStoreFilePath] (e.g., on macOS),

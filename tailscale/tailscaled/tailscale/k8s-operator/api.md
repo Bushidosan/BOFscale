@@ -12,12 +12,18 @@
 - [ConnectorList](#connectorlist)
 - [DNSConfig](#dnsconfig)
 - [DNSConfigList](#dnsconfiglist)
+- [PeerRelay](#peerrelay)
+- [PeerRelayList](#peerrelaylist)
 - [ProxyClass](#proxyclass)
 - [ProxyClassList](#proxyclasslist)
 - [ProxyGroup](#proxygroup)
 - [ProxyGroupList](#proxygrouplist)
+- [ProxyGroupPolicy](#proxygrouppolicy)
+- [ProxyGroupPolicyList](#proxygrouppolicylist)
 - [Recorder](#recorder)
 - [RecorderList](#recorderlist)
+- [Tailnet](#tailnet)
+- [TailnetList](#tailnetlist)
 
 
 
@@ -139,6 +145,7 @@ _Appears in:_
 | `appConnector` _[AppConnector](#appconnector)_ | AppConnector defines whether the Connector device should act as a Tailscale app connector. A Connector that is<br />configured as an app connector cannot be a subnet router or an exit node. If this field is unset, the<br />Connector does not act as an app connector.<br />Note that you will need to manually configure the permissions and the domains for the app connector via the<br />Admin panel.<br />Note also that the main tested and supported use case of this config option is to deploy an app connector on<br />Kubernetes to access SaaS applications available on the public internet. Using the app connector to expose<br />cluster workloads or other internal workloads to tailnet might work, but this is not a use case that we have<br />tested or optimised for.<br />If you are using the app connector to access SaaS applications because you need a predictable egress IP that<br />can be whitelisted, it is also your responsibility to ensure that cluster traffic from the connector flows<br />via that predictable IP, for example by enforcing that cluster egress traffic is routed via an egress NAT<br />device with a static IP address.<br />https://tailscale.com/kb/1281/app-connectors |  |  |
 | `exitNode` _boolean_ | ExitNode defines whether the Connector device should act as a Tailscale exit node. Defaults to false.<br />This field is mutually exclusive with the appConnector field.<br />https://tailscale.com/kb/1103/exit-nodes |  |  |
 | `replicas` _integer_ | Replicas specifies how many devices to create. Set this to enable<br />high availability for app connectors, subnet routers, or exit nodes.<br />https://tailscale.com/kb/1115/high-availability. Defaults to 1. |  | Minimum: 0 <br /> |
+| `tailnet` _string_ | Tailnet specifies the tailnet this Connector should join. If blank, the default tailnet is used. When set, this<br />name must match that of a valid Tailnet resource. This field is immutable and cannot be changed once set. |  |  |
 
 
 #### ConnectorStatus
@@ -344,6 +351,7 @@ _Validation:_
 
 _Appears in:_
 - [ConnectorSpec](#connectorspec)
+- [PeerRelaySpec](#peerrelayspec)
 - [ProxyGroupSpec](#proxygroupspec)
 
 
@@ -478,6 +486,8 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#toleration-v1-core) array_ | If specified, applies tolerations to the pods deployed by the DNSConfig resource. |  |  |
+| `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#affinity-v1-core)_ | If specified, applies affinity rules to the pods deployed by the DNSConfig resource. |  |  |
+| `nodeSelector` _object (keys:string, values:string)_ | If specified, applies node selector rules to the pods deployed by the DNSConfig resource. |  |  |
 
 
 #### NameserverService
@@ -527,6 +537,154 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `ports` _[PortRange](#portrange) array_ | The port ranges from which the operator will select NodePorts for the Services.<br />You must ensure that firewall rules allow UDP ingress traffic for these ports<br />to the node's external IPs.<br />The ports must be in the range of service node ports for the cluster (default `30000-32767`).<br />See https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport. |  | MinItems: 1 <br /> |
 | `selector` _object (keys:string, values:string)_ | A selector which will be used to select the node's that will have their `ExternalIP`'s advertised<br />by the ProxyGroup as Static Endpoints. |  |  |
+
+
+#### PeerRelay
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelayList](#peerrelaylist)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `PeerRelay` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[PeerRelaySpec](#peerrelayspec)_ | Spec describes the desired state of the PeerRelay.<br />More info:<br />https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status |  |  |
+| `status` _[PeerRelayStatus](#peerrelaystatus)_ | Status describes the status of the PeerRelay. This is set<br />and managed by the Tailscale operator. |  |  |
+
+
+#### PeerRelayAWS
+
+
+
+PeerRelayAWS contains AWS-specific configuration for a PeerRelay.
+
+
+
+_Appears in:_
+- [PeerRelaySpec](#peerrelayspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `elasticIPs` _[PeerRelayAWSElasticIP](#peerrelayawselasticip) array_ | ElasticIPs pins each replica to a specific AWS EIP allocation and subnet. Only meaningful when Network Load<br />Balancers are provisioned by the AWS Load Balancer Controller. ElasticIPs supplies one allocation-subnet pair<br />per replica: replica N uses ElasticIPs[N]. The list must be at least as long as spec.replicas so every replica<br />has a distinct EIP; extra entries are permitted so that scale-up doesn't immediately trip validation.<br />Pinning a subnet enables only that subnet's availability zone on the replica's load balancer, and a Network<br />Load Balancer only forwards to targets in an enabled zone. Nothing constrains the scheduler to place the<br />replica's pod in that zone, so a pod scheduled elsewhere, including after a reschedule, becomes unreachable<br />on its Elastic IP while still appearing healthy.<br />Every replica of a PeerRelay shares one pod template, so a ProxyClass referenced by spec.proxyClass can<br />confine the pods to a zone but cannot place different replicas in different zones. To use this field<br />safely, name subnets in a single availability zone and pin the pods to that same zone with a ProxyClass<br />setting spec.statefulSet.pod.nodeSelector to topology.kubernetes.io/zone. Note that this trades the zone<br />redundancy that running several replicas would otherwise buy. Spreading replicas across zones with their<br />own Elastic IPs needs a per-replica scheduling constraint that neither PeerRelay nor ProxyClass can<br />currently express.<br />When set, the reconciler stamps<br />service.beta.kubernetes.io/aws-load-balancer-eip-allocations and<br />service.beta.kubernetes.io/aws-load-balancer-subnets on each per-replica Service, overriding any values in<br />spec.service.annotations. |  | MinItems: 1 <br /> |
+
+
+#### PeerRelayAWSElasticIP
+
+
+
+PeerRelayAWSElasticIP pairs an EIP allocation with the subnet it is attached to.
+
+
+
+_Appears in:_
+- [PeerRelayAWS](#peerrelayaws)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `allocationID` _string_ | AllocationID is the AWS EIP allocation ID (e.g. eipalloc-0123abcd) whose public IP this replica is reachable<br />on. Stamped as service.beta.kubernetes.io/aws-load-balancer-eip-allocations on the replica's Service. |  | Pattern: `^eipalloc-[0-9a-f]+$` <br /> |
+| `subnetID` _string_ | SubnetID is the AWS subnet the replica's load balancer is provisioned in (e.g. subnet-0123abcd). It must be<br />a public subnet, and no two replicas may name subnets in the same availability zone, since a load balancer<br />accepts only one Elastic IP per zone. A standard VPC Elastic IP is regional rather than zonal, so it takes<br />the zone of whichever subnet it is paired with here. Stamped as<br />service.beta.kubernetes.io/aws-load-balancer-subnets on the replica's Service. |  | Pattern: `^subnet-[0-9a-f]+$` <br /> |
+
+
+#### PeerRelayEndpoint
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelayStatus](#peerrelaystatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `replica` _integer_ | Replica is the zero-based index of the peer relay replica this endpoint targets. |  |  |
+| `address` _string_ | Address is the public IP or hostname the cloud has allocated for this replica's LoadBalancer Service.<br />Peers reach this relay by connecting to Address:Port over UDP. |  |  |
+| `port` _integer_ | Port is the UDP port the peer relay listens on. |  |  |
+
+
+#### PeerRelayList
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `PeerRelayList` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `items` _[PeerRelay](#peerrelay) array_ |  |  |  |
+
+
+#### PeerRelayService
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelaySpec](#peerrelayspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `annotations` _object (keys:string, values:string)_ | Annotations to apply to the LoadBalancer service. Any annotations that conflict with those used by known<br />cloud providers to ensure IP addresses rather than DNS names are ignored. |  |  |
+
+
+#### PeerRelaySpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelay](#peerrelay)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `tags` _[Tags](#tags)_ | Tags that the Tailscale node will be tagged with.<br />Defaults to [tag:k8s].<br />To autoapprove the device defined by a PeerRelay,<br />you can configure Tailscale ACLs to give these tags the necessary<br />permissions.<br />See https://tailscale.com/kb/1337/acl-syntax#autoapprovers.<br />If you specify custom tags here, you must also make the operator an owner of these tags.<br />See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.<br />Tags cannot be changed once a PeerRelay node has been created.<br />Tag values must be in form ^tag:[a-zA-Z][a-zA-Z0-9-]*$. |  | Pattern: `^tag:[a-zA-Z][a-zA-Z0-9-]*$` <br />Type: string <br /> |
+| `hostnamePrefix` _[HostnamePrefix](#hostnameprefix)_ | HostnamePrefix specifies the hostname prefix for each<br />replica. Each device will have the integer number<br />from its StatefulSet pod appended to this prefix to form the full hostname.<br />HostnamePrefix can contain lower case letters, numbers and dashes, it<br />must not start with a dash and must be between 1 and 62 characters long. |  | Pattern: `^[a-z0-9][a-z0-9-]{0,61}$` <br />Type: string <br /> |
+| `proxyClass` _string_ | ProxyClass is the name of the ProxyClass custom resource that<br />contains configuration options that should be applied to the<br />resources created for this PeerRelay. If unset, the operator will<br />create resources with the default configuration. |  |  |
+| `replicas` _integer_ | Replicas specifies how many devices to create. Set this to enable<br />high availability for peer relays.<br />https://tailscale.com/kb/1115/high-availability. Defaults to 1. | 1 | Minimum: 0 <br /> |
+| `tailnet` _string_ | Tailnet specifies the tailnet this PeerRelay should join. If blank, the default tailnet is used. When set, this<br />name must match that of a valid Tailnet resource. This field is immutable and cannot be changed once set. |  |  |
+| `service` _[PeerRelayService](#peerrelayservice)_ | Service contains configuration values to modify the LoadBalancer service used to expose the peer relay. |  |  |
+| `aws` _[PeerRelayAWS](#peerrelayaws)_ | AWS contains configuration for pinning each replica to a specific AWS Elastic IP and subnet. Only meaningful<br />when running on EKS with the AWS Load Balancer Controller. When set, the per-replica values override any<br />aws-load-balancer-eip-allocations or aws-load-balancer-subnets values supplied via spec.service.annotations.<br />Leave this unset unless the peer relays must be reachable on addresses you control. Pinning a subnet<br />confines a replica's load balancer to that subnet's availability zone, and an AWS Network Load Balancer<br />only forwards to targets in a zone that is enabled on it, so a replica whose pod is scheduled into any<br />other zone stops receiving traffic. Setting this field therefore also requires pinning the pods to the<br />matching zone with a ProxyClass, as described on ElasticIPs. Without this field the AWS Load Balancer<br />Controller instead provisions each load balancer across every zone it discovers, and the operator turns on<br />cross-zone load balancing so the replica is reachable wherever it happens to be scheduled, with no<br />scheduling constraints needed. |  |  |
+
+
+#### PeerRelayStatus
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelay](#peerrelay)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#condition-v1-meta) array_ |  |  |  |
+| `endpoints` _[PeerRelayEndpoint](#peerrelayendpoint) array_ | Endpoints lists the public address:port pairs each peer relay replica is reachable on. Entries appear as the<br />underlying cloud provisions each Service. A replica has one entry per address its LoadBalancer Service was<br />given, which is usually one, but a load balancer spanning several availability zones has an address in each<br />and every one of them is listed. |  |  |
 
 
 #### Pod
@@ -722,6 +880,81 @@ _Appears in:_
 | `items` _[ProxyGroup](#proxygroup) array_ |  |  |  |
 
 
+#### ProxyGroupPolicy
+
+
+
+
+
+
+
+_Appears in:_
+- [ProxyGroupPolicyList](#proxygrouppolicylist)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `ProxyGroupPolicy` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[ProxyGroupPolicySpec](#proxygrouppolicyspec)_ | Spec describes the desired state of the ProxyGroupPolicy.<br />More info:<br />https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status |  |  |
+| `status` _[ProxyGroupPolicyStatus](#proxygrouppolicystatus)_ | Status describes the status of the ProxyGroupPolicy. This is set<br />and managed by the Tailscale operator. |  |  |
+
+
+#### ProxyGroupPolicyList
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `ProxyGroupPolicyList` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `items` _[ProxyGroupPolicy](#proxygrouppolicy) array_ |  |  |  |
+
+
+#### ProxyGroupPolicySpec
+
+
+
+
+
+
+
+_Appears in:_
+- [ProxyGroupPolicy](#proxygrouppolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `ingress` _string array_ | Names of ProxyGroup resources that can be used by Ingress resources within this namespace. An empty list<br />denotes that no ingress via ProxyGroups is allowed within this namespace. |  |  |
+| `egress` _string array_ | Names of ProxyGroup resources that can be used by Service resources within this namespace. An empty list<br />denotes that no egress via ProxyGroups is allowed within this namespace. |  |  |
+
+
+#### ProxyGroupPolicyStatus
+
+
+
+
+
+
+
+_Appears in:_
+- [ProxyGroupPolicy](#proxygrouppolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#condition-v1-meta) array_ |  |  |  |
+
+
 #### ProxyGroupSpec
 
 
@@ -741,6 +974,7 @@ _Appears in:_
 | `hostnamePrefix` _[HostnamePrefix](#hostnameprefix)_ | HostnamePrefix is the hostname prefix to use for tailnet devices created<br />by the ProxyGroup. Each device will have the integer number from its<br />StatefulSet pod appended to this prefix to form the full hostname.<br />HostnamePrefix can contain lower case letters, numbers and dashes, it<br />must not start with a dash and must be between 1 and 62 characters long. |  | Pattern: `^[a-z0-9][a-z0-9-]{0,61}$` <br />Type: string <br /> |
 | `proxyClass` _string_ | ProxyClass is the name of the ProxyClass custom resource that contains<br />configuration options that should be applied to the resources created<br />for this ProxyGroup. If unset, and there is no default ProxyClass<br />configured, the operator will create resources with the default<br />configuration. |  |  |
 | `kubeAPIServer` _[KubeAPIServerConfig](#kubeapiserverconfig)_ | KubeAPIServer contains configuration specific to the kube-apiserver<br />ProxyGroup type. This field is only used when Type is set to "kube-apiserver". |  |  |
+| `tailnet` _string_ | Tailnet specifies the tailnet this ProxyGroup should join. If blank, the default tailnet is used. When set, this<br />name must match that of a valid Tailnet resource. This field is immutable and cannot be changed once set. |  |  |
 
 
 #### ProxyGroupStatus
@@ -900,7 +1134,8 @@ _Appears in:_
 | `tags` _[Tags](#tags)_ | Tags that the Tailscale device will be tagged with. Defaults to [tag:k8s].<br />If you specify custom tags here, make sure you also make the operator<br />an owner of these tags.<br />See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.<br />Tags cannot be changed once a Recorder node has been created.<br />Tag values must be in form ^tag:[a-zA-Z][a-zA-Z0-9-]*$. |  | Pattern: `^tag:[a-zA-Z][a-zA-Z0-9-]*$` <br />Type: string <br /> |
 | `enableUI` _boolean_ | Set to true to enable the Recorder UI. The UI lists and plays recorded sessions.<br />The UI will be served at <MagicDNS name of the recorder>:443. Defaults to false.<br />Corresponds to --ui tsrecorder flag https://tailscale.com/kb/1246/tailscale-ssh-session-recording#deploy-a-recorder-node.<br />Required if S3 storage is not set up, to ensure that recordings are accessible. |  |  |
 | `storage` _[Storage](#storage)_ | Configure where to store session recordings. By default, recordings will<br />be stored in a local ephemeral volume, and will not be persisted past the<br />lifetime of a specific pod. |  |  |
-| `replicas` _integer_ | Replicas specifies how many instances of tsrecorder to run. Defaults to 1. |  | Minimum: 0 <br /> |
+| `replicas` _integer_ | Replicas specifies how many instances of tsrecorder to run. Defaults to 1. | 1 | Minimum: 0 <br /> |
+| `tailnet` _string_ | Tailnet specifies the tailnet this Recorder should join. If blank, the default tailnet is used. When set, this<br />name must match that of a valid Tailnet resource. This field is immutable and cannot be changed once set. |  |  |
 
 
 #### RecorderStatefulSet
@@ -1149,9 +1384,48 @@ _Validation:_
 
 _Appears in:_
 - [ConnectorSpec](#connectorspec)
+- [PeerRelaySpec](#peerrelayspec)
 - [ProxyGroupSpec](#proxygroupspec)
 - [RecorderSpec](#recorderspec)
 
+
+
+#### Tailnet
+
+
+
+
+
+
+
+_Appears in:_
+- [TailnetList](#tailnetlist)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `Tailnet` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[TailnetSpec](#tailnetspec)_ | Spec describes the desired state of the Tailnet.<br />More info:<br />https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status |  |  |
+| `status` _[TailnetStatus](#tailnetstatus)_ | Status describes the status of the Tailnet. This is set<br />and managed by the Tailscale operator. |  |  |
+
+
+#### TailnetCredentials
+
+
+
+
+
+
+
+_Appears in:_
+- [TailnetSpec](#tailnetspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `secretName` _string_ | The name of the secret containing the credentials used to authenticate with this Tailnet. The secret must always<br />contain a "client_id" field. To authenticate with a static OAuth client, also set "client_secret". To authenticate<br />via workload identity federation, set "audience" to the audience value expected by the Tailscale OAuth<br />client; the operator will mint a ServiceAccount token for itself with that audience and exchange it for an API<br />token. "client_secret" and "audience" are mutually exclusive. |  |  |
 
 
 #### TailnetDevice
@@ -1170,6 +1444,59 @@ _Appears in:_
 | `hostname` _string_ | Hostname is the fully qualified domain name of the device.<br />If MagicDNS is enabled in your tailnet, it is the MagicDNS name of the<br />node. |  |  |
 | `tailnetIPs` _string array_ | TailnetIPs is the set of tailnet IP addresses (both IPv4 and IPv6)<br />assigned to the device. |  |  |
 | `staticEndpoints` _string array_ | StaticEndpoints are user configured, 'static' endpoints by which tailnet peers can reach this device. |  |  |
+
+
+#### TailnetList
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `TailnetList` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `items` _[Tailnet](#tailnet) array_ |  |  |  |
+
+
+#### TailnetSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [Tailnet](#tailnet)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `loginUrl` _string_ | URL of the control plane to be used by all resources managed by the operator using this Tailnet. |  |  |
+| `credentials` _[TailnetCredentials](#tailnetcredentials)_ | Denotes the location of the credentials to use for authenticating with this Tailnet. |  |  |
+
+
+#### TailnetStatus
+
+
+
+
+
+
+
+_Appears in:_
+- [Tailnet](#tailnet)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#condition-v1-meta) array_ |  |  |  |
 
 
 #### TailscaleConfig

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // This file contains tests and benchmarks that use types from other packages
@@ -86,11 +86,6 @@ func getVal() *tailscaleTypes {
 	return &tailscaleTypes{
 		&wgcfg.Config{
 			Addresses: []netip.Prefix{netip.PrefixFrom(netip.AddrFrom16([16]byte{3: 3}).Unmap(), 5)},
-			Peers: []wgcfg.Peer{
-				{
-					PublicKey: key.NodePublic{},
-				},
-			},
 		},
 		&router.Config{
 			Routes: []netip.Prefix{

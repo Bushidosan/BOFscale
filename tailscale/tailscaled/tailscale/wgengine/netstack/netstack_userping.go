@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !darwin && !ios
@@ -18,12 +18,6 @@ import (
 	"tailscale.com/version/distro"
 )
 
-// setAmbientCapsRaw is non-nil on Linux for Synology, to run ping with
-// CAP_NET_RAW from tailscaled's binary.
-var setAmbientCapsRaw func(*exec.Cmd)
-
-var isSynology = runtime.GOOS == "linux" && buildfeatures.HasSynology && distro.Get() == distro.Synology
-
 type PingResult struct {
 	Address       net.IP
 	Status        uint32
@@ -33,21 +27,24 @@ type PingResult struct {
 	IsIPv6        bool
 }
 
+// setAmbientCapsRaw is non-nil on Linux for Synology, to run ping with
+// CAP_NET_RAW from tailscaled's binary.
+var setAmbientCapsRaw func(*exec.Cmd)
+
+var isSynology = runtime.GOOS == "linux" && buildfeatures.HasSynology && distro.Get() == distro.Synology
+
 // sendOutboundUserPing sends a non-privileged ICMP (or ICMPv6) ping to dstIP with the given timeout.
 func (ns *Impl) sendOutboundUserPing(dstIP netip.Addr, timeout time.Duration) error {
 	var err error
 	switch runtime.GOOS {
 	case "windows":
-		var result *PingResult
 		result, err := Ping(dstIP.String(), 3000)
-		if err != nil || result.Status != 0 {
-			if err != nil {
-				return err
-			} else {
-				return fmt.Errorf("Got status %d when sending ping to %s\n", result.Status, dstIP.String())
-			}
+		if err != nil {
+			return err
 		}
-
+		if result.Status != 0 {
+			return fmt.Errorf("ping %s: status %d", dstIP, result.Status)
+		}
 	case "freebsd":
 		// Note: 2000 ms is actually 1 second + 2,000
 		// milliseconds extra for 3 seconds total.

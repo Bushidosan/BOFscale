@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package chonktest contains a shared set of tests for the Chonk
@@ -78,6 +78,25 @@ func RunChonkTests(t *testing.T, newChonk func(*testing.T) tka.Chonk) {
 		}
 		if diff := cmp.Diff(data, stored, cmpopts.SortSlices(aumHashesLess)); diff != "" {
 			t.Errorf("stored AUM differs (-want, +got):\n%s", diff)
+		}
+
+		// Commit another child after ChildAUMs has been called, then check that
+		// subsequent reads include it.
+		additional := tka.AUM{
+			MessageKind: tka.AUMRemoveKey,
+			KeyID:       []byte{5, 6},
+			PrevAUMHash: parentHash[:],
+		}
+		if err := chonk.CommitVerifiedAUMs([]tka.AUM{additional}); err != nil {
+			t.Fatalf("additional CommitVerifiedAUMs failed: %v", err)
+		}
+		stored, err = chonk.ChildAUMs(parentHash)
+		if err != nil {
+			t.Fatalf("ChildAUMs after additional commit failed: %v", err)
+		}
+		data = append(data, additional)
+		if diff := cmp.Diff(data, stored, cmpopts.SortSlices(aumHashesLess)); diff != "" {
+			t.Errorf("stored AUMs after additional commit differ (-want, +got):\n%s", diff)
 		}
 	})
 

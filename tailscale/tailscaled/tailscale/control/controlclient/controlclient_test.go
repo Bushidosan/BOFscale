@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
@@ -38,8 +38,8 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := range t.NumField() {
-		if name := t.Field(i).Name; name != "_" {
+	for field := range t.Fields() {
+		if name := field.Name; name != "_" {
 			fields = append(fields, name)
 		}
 	}
@@ -98,6 +98,7 @@ func TestCanSkipStatus(t *testing.T) {
 	nm1 := &netmap.NetworkMap{}
 	nm2 := &netmap.NetworkMap{}
 
+	commonPersist := new(persist.Persist).View()
 	tests := []struct {
 		name   string
 		s1, s2 *Status
@@ -165,8 +166,8 @@ func TestCanSkipStatus(t *testing.T) {
 		},
 		{
 			name: "skip",
-			s1:   &Status{NetMap: nm1},
-			s2:   &Status{NetMap: nm2},
+			s1:   &Status{NetMap: nm1, LoggedIn: true, InMapPoll: true, Persist: commonPersist},
+			s2:   &Status{NetMap: nm2, LoggedIn: true, InMapPoll: true, Persist: commonPersist},
 			want: true,
 		},
 	}
@@ -196,7 +197,7 @@ func TestRetryableErrors(t *testing.T) {
 		{fmt.Errorf("%w: %w", errHTTPPostFailure, errors.New("bad post")), true},
 		{fmt.Errorf("%w: %w", errNoNodeKey, errors.New("not node key")), true},
 		{errBadHTTPResponse(429, "too may requests"), true},
-		{errBadHTTPResponse(500, "internal server eror"), true},
+		{errBadHTTPResponse(500, "internal server error"), true},
 		{errBadHTTPResponse(502, "bad gateway"), true},
 		{errBadHTTPResponse(503, "service unavailable"), true},
 		{errBadHTTPResponse(504, "gateway timeout"), true},
@@ -213,12 +214,12 @@ func TestRetryableErrors(t *testing.T) {
 }
 
 type retryableForTest interface {
+	error
 	Retryable() bool
 }
 
 func isRetryableErrorForTest(err error) bool {
-	var ae retryableForTest
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[retryableForTest](err); ok {
 		return ae.Retryable()
 	}
 	return false
@@ -402,6 +403,118 @@ func testHTTPS(t *testing.T, withProxy bool) {
 		if got, want := proxyReqs.Load(), int64(1); got != want {
 			t.Errorf("proxy CONNECT requests = %d; want %d", got, want)
 		}
+	}
+}
+
+// TestRegisterRateLimited verifies that the client correctly handles 429
+// responses to registration requests by parsing the Retry-After header
+// and returning a rateLimitError.
+func TestRegisterRateLimited(t *testing.T) {
+	bakedroots.ResetForTest(t, tlstest.TestRootCA())
+
+	bus := eventbustest.NewBus(t)
+
+	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", tlstest.ControlPlane.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controlLn.Close()
+
+	var registerAttempts atomic.Int64
+	tc := &testcontrol.Server{
+		Logf: tstest.WhileTestRunningLogger(t),
+		MaybeRateLimitRegister: func() (bool, string, string) {
+			if registerAttempts.Add(1) == 1 {
+				return true, "30", "try again later"
+			}
+			return false, "", ""
+		},
+	}
+	controlSrv := &http.Server{
+		Handler:  tc,
+		ErrorLog: logger.StdLogger(t.Logf),
+	}
+	go controlSrv.Serve(controlLn)
+
+	const fakeControlIP = "1.2.3.4"
+
+	dialer := &tsdial.Dialer{}
+	dialer.SetNetMon(netmon.NewStatic())
+	dialer.SetBus(bus)
+	dialer.SetSystemDialerForTest(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("SplitHostPort(%q): %v", addr, err)
+		}
+		var d net.Dialer
+		if host == fakeControlIP {
+			return d.DialContext(ctx, network, controlLn.Addr().String())
+		}
+		return nil, fmt.Errorf("unexpected dial to %q", addr)
+	})
+
+	opts := Options{
+		Persist: persist.Persist{},
+		GetMachinePrivateKey: func() (key.MachinePrivate, error) {
+			return key.NewMachine(), nil
+		},
+		ServerURL: "https://controlplane.tstest",
+		Clock:     tstime.StdClock{},
+		Hostinfo: &tailcfg.Hostinfo{
+			BackendLogID: "test-backend-log-id",
+		},
+		DiscoPublicKey: key.NewDisco().Public(),
+		Logf:           t.Logf,
+		HealthTracker:  health.NewTracker(bus),
+		PopBrowserURL: func(url string) {
+			t.Logf("PopBrowserURL: %q", url)
+		},
+		Dialer: dialer,
+		Bus:    bus,
+	}
+	d, err := NewDirect(opts)
+	if err != nil {
+		t.Fatalf("NewDirect: %v", err)
+	}
+
+	d.dnsCache.LookupIPForTest = func(ctx context.Context, host string) ([]netip.Addr, error) {
+		if host == "controlplane.tstest" {
+			return []netip.Addr{netip.MustParseAddr(fakeControlIP)}, nil
+		}
+		t.Errorf("unexpected DNS query for %q", host)
+		return nil, fmt.Errorf("unexpected DNS lookup for %q", host)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// First attempt should get a 429 and return a rateLimitError.
+	_, err = d.TryLogin(ctx, LoginEphemeral)
+	if err == nil {
+		t.Fatal("expected rate limit error on first attempt, got nil")
+	}
+	var rle *rateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("expected *rateLimitError, got %T: %v", err, err)
+	}
+	if rle.retryAfter != 30*time.Second {
+		t.Errorf("retryAfter = %v, want 30s", rle.retryAfter)
+	}
+	if rle.msg != "try again later" {
+		t.Errorf("msg = %q, want %q", rle.msg, "try again later")
+	}
+
+	// Second attempt should succeed (server no longer rate-limiting).
+	url, err := d.TryLogin(ctx, LoginEphemeral)
+	if err != nil {
+		t.Fatalf("TryLogin after rate limit: %v", err)
+	}
+	if url != "" {
+		t.Errorf("got URL %q, want empty", url)
+	}
+
+	if got := registerAttempts.Load(); got != 2 {
+		t.Errorf("register attempts = %d, want 2", got)
 	}
 }
 

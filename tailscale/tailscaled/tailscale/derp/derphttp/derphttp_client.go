@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package derphttp implements DERP-over-HTTP.
@@ -60,6 +60,7 @@ type Client struct {
 	DNSCache      *dnscache.Resolver // optional; nil means no caching
 	MeshKey       key.DERPMesh       // optional; for trusted clients
 	IsProber      bool               // optional; for probers to optional declare themselves as such
+	AppName       string             // optional; opaque app name to advertise to the server for stats
 
 	// WatchConnectionChanges is whether the client wishes to subscribe to
 	// notifications about clients connecting & disconnecting.
@@ -179,7 +180,7 @@ func NewClient(privateKey key.NodePrivate, serverURL string, logf logger.Logf, n
 
 // isStarted reports whether this client has been used yet.
 //
-// If if reports false, it may still have its exported fields configured.
+// If it reports false, it may still have its exported fields configured.
 func (c *Client) isStarted() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -280,10 +281,16 @@ func (c *Client) urlString(node *tailcfg.DERPNode) string {
 		return c.url.String()
 	}
 	proto := "https"
+	defaultPort := 443
 	if debugUseDERPHTTP() {
 		proto = "http"
+		defaultPort = 80
 	}
-	return fmt.Sprintf("%s://%s/derp", proto, node.HostName)
+	host := node.HostName
+	if node.DERPPort != 0 && node.DERPPort != defaultPort {
+		host = net.JoinHostPort(host, fmt.Sprint(node.DERPPort))
+	}
+	return fmt.Sprintf("%s://%s/derp", proto, host)
 }
 
 // AddressFamilySelector decides whether IPv6 is preferred for
@@ -326,45 +333,6 @@ func useWebsockets() bool {
 		return envknob.Bool("TS_DEBUG_DERP_WS_CLIENT")
 	}
 	return false
-}
-
-func (c *Client) dialWebsocket(ctx context.Context, caller string, reg *tailcfg.DERPRegion) (client *derp.Client, connGen int, err error) {
-
-	var urlStr string
-	if c.url != nil {
-		urlStr = c.url.String()
-	} else {
-		urlStr = c.urlString(reg.Nodes[0])
-	}
-	c.logf("%s: connecting websocket to %v", caller, urlStr)
-	conn, err := dialWebsocketFunc(ctx, urlStr)
-	if err != nil {
-		c.logf("%s: websocket to %v error: %v", caller, urlStr, err)
-		return nil, 0, err
-	}
-	brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
-	derpClient, err := derp.NewClient(c.privateKey, conn, brw, c.logf,
-		derp.MeshKey(c.MeshKey),
-		derp.CanAckPings(c.canAckPings),
-		derp.IsProber(c.IsProber),
-	)
-	if err != nil {
-		go conn.Close()
-		return nil, 0, err
-	}
-	if c.preferred {
-		if err := derpClient.NotePreferred(true); err != nil {
-			go conn.Close()
-			return nil, 0, err
-		}
-	}
-	c.serverPubKey = derpClient.ServerPublicKey()
-	c.client = derpClient
-	c.netConn = conn
-	c.connGen++
-	c.atomicState.Store(ConnectedState{Connected: true})
-
-	return c.client, c.connGen, nil
 }
 
 func (c *Client) connect(ctx context.Context, caller string) (client *derp.Client, connGen int, err error) {
@@ -550,16 +518,13 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 			return nil, 0, err
 		}
 		if resp.StatusCode != http.StatusSwitchingProtocols {
-
-			if resp.StatusCode != 426 {
-				b, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
-			} else {
-				// If we fail using DERP socket, try websocket instead
-				c.logf("%s: connecting to derp-%d (%v) via websocket due to HTTP status 426", caller, reg.RegionID, reg.RegionCode)
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if canFallbackWebsockets() && !useWebsockets() {
+				c.logf("%s: HTTP upgrade returned %d, falling back to websockets", caller, resp.StatusCode)
 				return c.dialWebsocket(ctx, caller, reg)
 			}
+			return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
 		}
 	}
 	derpClient, err = derp.NewClient(c.privateKey, httpConn, brw, c.logf,
@@ -567,6 +532,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		derp.ServerPublicKey(serverPub),
 		derp.CanAckPings(c.canAckPings),
 		derp.IsProber(c.IsProber),
+		derp.AppName(c.AppName),
 	)
 	if err != nil {
 		return nil, 0, err
@@ -882,7 +848,15 @@ func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, pr
 		}
 	}()
 
-	target := net.JoinHostPort(n.HostName, "443")
+	// Keep port selection in sync with dialNode.
+	port := "443"
+	if !c.useHTTPS() {
+		port = "3340"
+	}
+	if n.DERPPort != 0 {
+		port = fmt.Sprint(n.DERPPort)
+	}
+	target := net.JoinHostPort(n.HostName, port)
 
 	var authHeader string
 	if buildfeatures.HasUseProxy {

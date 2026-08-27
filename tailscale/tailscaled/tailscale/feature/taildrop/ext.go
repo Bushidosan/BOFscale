@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package taildrop
@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -139,8 +138,8 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	uid := profile.UserProfile().ID
-	activeLogin := profile.UserProfile().LoginName
+	uid := profile.UserProfile().ID()
+	activeLogin := profile.UserProfile().LoginName()
 
 	if uid == 0 {
 		e.setMgrLocked(nil)
@@ -411,14 +410,16 @@ func (e *Extension) taildropTargetStatus(p tailcfg.NodeView, nb ipnext.NodeBacke
 	return ipnstate.TaildropTargetAvailable
 }
 
-// updateOutgoingFiles updates b.outgoingFiles to reflect the given updates and
-// sends an ipn.Notify with the full list of outgoingFiles.
-func (e *Extension) updateOutgoingFiles(updates map[string]*ipn.OutgoingFile) {
+// updateOutgoingFiles merges updates into e.outgoingFiles and emits an
+// ipn.Notify.
+func (e *Extension) updateOutgoingFiles(updates map[string]ipn.OutgoingFile) {
 	e.mu.Lock()
 	if e.outgoingFiles == nil {
 		e.outgoingFiles = make(map[string]*ipn.OutgoingFile, len(updates))
 	}
-	maps.Copy(e.outgoingFiles, updates)
+	for id, f := range updates {
+		e.outgoingFiles[id] = &f
+	}
 	outgoingFiles := make([]*ipn.OutgoingFile, 0, len(e.outgoingFiles))
 	for _, file := range e.outgoingFiles {
 		outgoingFiles = append(outgoingFiles, file)

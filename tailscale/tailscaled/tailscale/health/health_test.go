@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package health
@@ -82,8 +82,7 @@ func TestAppendWarnableDebugFlags(t *testing.T) {
 func TestNilMethodsDontCrash(t *testing.T) {
 	var nilt *Tracker
 	rv := reflect.ValueOf(nilt)
-	for i := 0; i < rv.NumMethod(); i++ {
-		mt := rv.Type().Method(i)
+	for mt, method := range rv.Methods() {
 		t.Logf("calling Tracker.%s ...", mt.Name)
 		var args []reflect.Value
 		for j := 0; j < mt.Type.NumIn(); j++ {
@@ -92,7 +91,7 @@ func TestNilMethodsDontCrash(t *testing.T) {
 			}
 			args = append(args, reflect.Zero(mt.Type.In(j)))
 		}
-		rv.Method(i).Call(args)
+		method.Call(args)
 	}
 }
 
@@ -272,47 +271,91 @@ func TestSetUnhealthyWithTimeToVisible(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(*testing.T) {
-			bus := eventbustest.NewBus(t)
-			ht := NewTracker(bus)
-			mw := Register(&Warnable{
-				Code:                "test-warnable-3-secs-to-visible",
-				Title:               "Test Warnable with 3 seconds to visible",
-				Text:                StaticMessage("Hello world"),
-				TimeToVisible:       2 * time.Second,
-				ImpactsConnectivity: true,
+			synctest.Test(t, func(t *testing.T) {
+				clock := tstest.NewClock(tstest.ClockOpts{
+					Start:          time.Unix(123, 0),
+					FollowRealTime: false,
+				})
+				bus := eventbustest.NewBus(t)
+				ht := NewTracker(bus)
+				ht.testClock = clock
+				mw := Register(&Warnable{
+					Code:                "test-warnable-3-secs-to-visible",
+					Title:               "Test Warnable with 3 seconds to visible",
+					Text:                StaticMessage("Hello world"),
+					TimeToVisible:       2 * time.Second,
+					ImpactsConnectivity: true,
+				})
+				defer unregister(mw)
+
+				becameUnhealthy := make(chan struct{})
+				becameHealthy := make(chan struct{})
+
+				watchFunc := func(c Change) {
+					w := c.Warnable
+					us := c.UnhealthyState
+					if w != mw {
+						t.Fatalf("watcherFunc was called, but with an unexpected Warnable: %v, want: %v", w, w)
+					}
+
+					if us != nil {
+						becameUnhealthy <- struct{}{}
+					} else {
+						becameHealthy <- struct{}{}
+					}
+				}
+
+				tt.preFunc(t, ht, bus, watchFunc)
+				ht.SetUnhealthy(mw, Args{ArgError: "Hello world"})
+
+				// Advance time by half of the TimeToVisible duration.
+				clock.Advance(mw.TimeToVisible / 2)
+
+				select {
+				case <-becameUnhealthy:
+					// Test failed because the watcher got notified of an unhealthy state
+					t.Fatalf("watcherFunc was called with an unhealthy state")
+				case <-becameHealthy:
+					// Test failed because the watcher got of a healthy state
+					t.Fatalf("watcherFunc was called with a healthy state")
+				default:
+					// As expected, watcherFunc still had not been called
+					// after mw.TimeToVisible / 2.
+				}
+
+				// Advance time to get past the TimeToVisible duration.
+				// The watcher should be notified of the unhealthy state.
+				clock.Advance(mw.TimeToVisible/2 + 1)
+				<-becameUnhealthy
+
+				// Reset the warnable to neutral / healthy state before
+				// the next part of the test.
+				ht.SetHealthy(mw)
+				<-becameHealthy
+
+				// Mark the warnable unhealthy and then immediately healthy
+				// before the TimeToVisible duration elapses.
+				// The watcher should not be notified of either change
+				// because the warnable never became visible.
+				ht.SetUnhealthy(mw, Args{ArgError: "Hello world"})
+				ht.SetHealthy(mw)
+
+				// Advance to get past the TimeToVisible delay.
+				clock.Advance(mw.TimeToVisible * 2)
+				synctest.Wait()
+
+				select {
+				case <-becameUnhealthy:
+					// Test failed because the watcher got notified of an unhealthy state
+					t.Fatalf("watcherFunc was called with an unhealthy state")
+				case <-becameHealthy:
+					// Test failed because the watcher got of a healthy state
+					t.Fatalf("watcherFunc was called with a healthy state")
+				default:
+					// As expected, watcherFunc was not called after marking
+					// the warnable healthy again as it never became visible.
+				}
 			})
-
-			becameUnhealthy := make(chan struct{})
-			becameHealthy := make(chan struct{})
-
-			watchFunc := func(c Change) {
-				w := c.Warnable
-				us := c.UnhealthyState
-				if w != mw {
-					t.Fatalf("watcherFunc was called, but with an unexpected Warnable: %v, want: %v", w, w)
-				}
-
-				if us != nil {
-					becameUnhealthy <- struct{}{}
-				} else {
-					becameHealthy <- struct{}{}
-				}
-			}
-
-			tt.preFunc(t, ht, bus, watchFunc)
-			ht.SetUnhealthy(mw, Args{ArgError: "Hello world"})
-
-			select {
-			case <-becameUnhealthy:
-				// Test failed because the watcher got notified of an unhealthy state
-				t.Fatalf("watcherFunc was called with an unhealthy state")
-			case <-becameHealthy:
-				// Test failed because the watcher got of a healthy state
-				t.Fatalf("watcherFunc was called with a healthy state")
-			case <-time.After(1 * time.Second):
-				// As expected, watcherFunc still had not been called after 1 second
-			}
-			unregister(mw)
 		})
 	}
 }
@@ -389,7 +432,7 @@ func TestShowUpdateWarnable(t *testing.T) {
 		wantShow     bool
 	}{
 		{
-			desc:         "nil ClientVersion",
+			desc:         "nil-ClientVersion",
 			check:        true,
 			cv:           nil,
 			wantWarnable: nil,
@@ -403,35 +446,35 @@ func TestShowUpdateWarnable(t *testing.T) {
 			wantShow:     false,
 		},
 		{
-			desc:         "no LatestVersion",
+			desc:         "no-LatestVersion",
 			check:        true,
 			cv:           &tailcfg.ClientVersion{RunningLatest: false, LatestVersion: ""},
 			wantWarnable: nil,
 			wantShow:     false,
 		},
 		{
-			desc:         "show regular update",
+			desc:         "show-regular-update",
 			check:        true,
 			cv:           &tailcfg.ClientVersion{RunningLatest: false, LatestVersion: "1.2.3"},
 			wantWarnable: updateAvailableWarnable,
 			wantShow:     true,
 		},
 		{
-			desc:         "show security update",
+			desc:         "show-security-update",
 			check:        true,
 			cv:           &tailcfg.ClientVersion{RunningLatest: false, LatestVersion: "1.2.3", UrgentSecurityUpdate: true},
 			wantWarnable: securityUpdateAvailableWarnable,
 			wantShow:     true,
 		},
 		{
-			desc:         "update check disabled",
+			desc:         "update-check-disabled",
 			check:        false,
 			cv:           &tailcfg.ClientVersion{RunningLatest: false, LatestVersion: "1.2.3"},
 			wantWarnable: nil,
 			wantShow:     false,
 		},
 		{
-			desc:         "hide update with auto-updates",
+			desc:         "hide-update-with-auto-updates",
 			check:        true,
 			apply:        opt.NewBool(true),
 			cv:           &tailcfg.ClientVersion{RunningLatest: false, LatestVersion: "1.2.3"},
@@ -439,7 +482,7 @@ func TestShowUpdateWarnable(t *testing.T) {
 			wantShow:     false,
 		},
 		{
-			desc:         "show security update with auto-updates",
+			desc:         "show-security-update-with-auto-updates",
 			check:        true,
 			apply:        opt.NewBool(true),
 			cv:           &tailcfg.ClientVersion{RunningLatest: false, LatestVersion: "1.2.3", UrgentSecurityUpdate: true},
@@ -534,7 +577,7 @@ func TestNoDERPHomeWarnable(t *testing.T) {
 	clock.Advance(30 * time.Second)
 	ht.updateBuiltinWarnablesLocked()
 
-	// Advance to get past the the TimeToVisible delay.
+	// Advance to get past the TimeToVisible delay.
 	clock.Advance(noDERPHomeWarnable.TimeToVisible * 2)
 
 	ht.updateBuiltinWarnablesLocked()
@@ -623,7 +666,7 @@ func TestControlHealth(t *testing.T) {
 		}
 	})
 
-	t.Run("Strings()", func(t *testing.T) {
+	t.Run("Strings", func(t *testing.T) {
 		wantStrs := []string{
 			"Control health message: Extra help.",
 			"Control health message: Extra help. Learn more: http://www.example.com",
@@ -740,12 +783,11 @@ func TestControlHealthNotifies(t *testing.T) {
 				ht.SetIPNState("NeedsLogin", true)
 				ht.GotStreamedMapResponse()
 
-				// Expect events at starup, before doing anything else, skip unstable
-				// event and no warning event as they show up at different times.
+				// Expect events at starup, before doing anything else, skip
+				// the warming up events.
 				synctest.Wait()
 				if err := eventbustest.Expect(tw,
 					CompareWarnableCode(t, tsconst.HealthWarnableWarmingUp),
-					CompareWarnableCode(t, tsconst.HealthWarnableNotInMapPoll),
 					CompareWarnableCode(t, tsconst.HealthWarnableWarmingUp),
 				); err != nil {
 					t.Errorf("startup error: %v", err)
@@ -997,6 +1039,89 @@ func TestCurrentStateETagWarnable(t *testing.T) {
 
 		if state.ETag != newState.ETag {
 			t.Errorf("got changed ETag, want unchanged")
+		}
+	})
+}
+
+func TestIPForwardingState(t *testing.T) {
+	tests := []struct {
+		name          string
+		checkFunc     func() bool // nil means no check function
+		wantUnhealthy bool
+	}{
+		{
+			name:          "broken",
+			checkFunc:     func() bool { return true },
+			wantUnhealthy: true,
+		},
+		{
+			name:          "healthy",
+			checkFunc:     func() bool { return false },
+			wantUnhealthy: false,
+		},
+		{
+			name:          "no_check_function",
+			checkFunc:     nil,
+			wantUnhealthy: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bus := eventbus.New()
+			tr := NewTracker(bus)
+			defer bus.Close()
+
+			tr.SetIPNState("Running", true)
+			tr.SetIPForwardingCheck(tt.checkFunc)
+
+			tr.mu.Lock()
+			tr.updateBuiltinWarnablesLocked()
+			tr.mu.Unlock()
+
+			got := tr.IsUnhealthy(ipForwardingWarnable)
+			if got != tt.wantUnhealthy {
+				t.Errorf("IsUnhealthy(ipForwardingWarnable) = %v, want %v", got, tt.wantUnhealthy)
+			}
+		})
+	}
+
+	// Test state transitions
+	t.Run("transitions", func(t *testing.T) {
+		bus := eventbus.New()
+		tr := NewTracker(bus)
+		defer bus.Close()
+
+		tr.SetIPNState("Running", true)
+
+		// Start broken
+		tr.SetIPForwardingCheck(func() bool { return true })
+		tr.mu.Lock()
+		tr.updateBuiltinWarnablesLocked()
+		tr.mu.Unlock()
+
+		if !tr.IsUnhealthy(ipForwardingWarnable) {
+			t.Fatal("expected IP forwarding to be unhealthy initially")
+		}
+
+		// Transition to healthy
+		tr.SetIPForwardingCheck(func() bool { return false })
+		tr.mu.Lock()
+		tr.updateBuiltinWarnablesLocked()
+		tr.mu.Unlock()
+
+		if tr.IsUnhealthy(ipForwardingWarnable) {
+			t.Fatal("expected IP forwarding to be healthy after transition")
+		}
+
+		// Transition to nil (should stay healthy)
+		tr.SetIPForwardingCheck(nil)
+		tr.mu.Lock()
+		tr.updateBuiltinWarnablesLocked()
+		tr.mu.Unlock()
+
+		if tr.IsUnhealthy(ipForwardingWarnable) {
+			t.Fatal("expected IP forwarding to be healthy after clearing check")
 		}
 	})
 }

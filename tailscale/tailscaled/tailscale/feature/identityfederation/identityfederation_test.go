@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package identityfederation
@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"tailscale.com/internal/client/tailscale"
 )
 
 func TestResolveAuthKey(t *testing.T) {
@@ -16,6 +18,7 @@ func TestResolveAuthKey(t *testing.T) {
 		name        string
 		clientID    string
 		idToken     string
+		audience    string
 		tags        []string
 		wantAuthKey string
 		wantErr     string
@@ -24,36 +27,41 @@ func TestResolveAuthKey(t *testing.T) {
 			name:        "success",
 			clientID:    "client-123",
 			idToken:     "token",
+			audience:    "api://tailscale-wif",
 			tags:        []string{"tag:test"},
 			wantAuthKey: "tskey-auth-xyz",
 			wantErr:     "",
 		},
 		{
-			name:        "missing client id short-circuits without error",
+			name:        "missing-client-id-noop",
 			clientID:    "",
 			idToken:     "token",
+			audience:    "api://tailscale-wif",
 			tags:        []string{"tag:test"},
 			wantAuthKey: "",
 			wantErr:     "",
 		},
 		{
-			name:     "missing id token",
+			name:     "missing-id-token-and-audience",
 			clientID: "client-123",
 			idToken:  "",
+			audience: "",
 			tags:     []string{"tag:test"},
-			wantErr:  "federated identity authkeys require --id-token",
+			wantErr:  "federated identity requires either an ID token or an audience",
 		},
 		{
-			name:     "missing tags",
+			name:     "missing-tags",
 			clientID: "client-123",
 			idToken:  "token",
+			audience: "api://tailscale-wif",
 			tags:     []string{},
 			wantErr:  "federated identity authkeys require --advertise-tags",
 		},
 		{
-			name:     "invalid client id attributes",
+			name:     "invalid-client-id-attrs",
 			clientID: "client-123?invalid=value",
 			idToken:  "token",
+			audience: "api://tailscale-wif",
 			tags:     []string{"tag:test"},
 			wantErr:  `failed to parse optional config attributes: unknown optional config attribute "invalid"`,
 		},
@@ -64,7 +72,13 @@ func TestResolveAuthKey(t *testing.T) {
 			srv := mockedControlServer(t)
 			defer srv.Close()
 
-			authKey, err := resolveAuthKey(context.Background(), srv.URL, tt.clientID, tt.idToken, tt.tags)
+			authKey, err := resolveAuthKey(context.Background(), tailscale.ResolveAuthKeyWIFArgs{
+				BaseURL:  srv.URL,
+				ClientID: tt.clientID,
+				IDToken:  tt.idToken,
+				Audience: tt.audience,
+				Tags:     tt.tags,
+			})
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Errorf("resolveAuthKey() error = nil, want %q", tt.wantErr)
@@ -93,7 +107,7 @@ func TestParseOptionalAttributes(t *testing.T) {
 		wantErr       string
 	}{
 		{
-			name:          "default values",
+			name:          "default-values",
 			clientID:      "client-123",
 			wantClientID:  "client-123",
 			wantEphemeral: true,
@@ -101,7 +115,7 @@ func TestParseOptionalAttributes(t *testing.T) {
 			wantErr:       "",
 		},
 		{
-			name:          "custom values",
+			name:          "custom-values",
 			clientID:      "client-123?ephemeral=false&preauthorized=true",
 			wantClientID:  "client-123",
 			wantEphemeral: false,
@@ -109,7 +123,7 @@ func TestParseOptionalAttributes(t *testing.T) {
 			wantErr:       "",
 		},
 		{
-			name:          "unknown attribute",
+			name:          "unknown-attribute",
 			clientID:      "client-123?unknown=value",
 			wantClientID:  "",
 			wantEphemeral: false,
@@ -117,7 +131,7 @@ func TestParseOptionalAttributes(t *testing.T) {
 			wantErr:       `unknown optional config attribute "unknown"`,
 		},
 		{
-			name:          "invalid value",
+			name:          "invalid-value",
 			clientID:      "client-123?ephemeral=invalid",
 			wantClientID:  "",
 			wantEphemeral: false,

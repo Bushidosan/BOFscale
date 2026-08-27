@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -32,6 +32,8 @@ services on the host to use Tailscale in more ways.
 		Subcommands: nonNilCmds(
 			configureKubeconfigCmd(),
 			synologyConfigureCmd(),
+			flashApplianceCmd(),
+			pveApplianceCmd(),
 			ccall(maybeConfigSynologyCertCmd),
 			ccall(maybeSysExtCmd),
 			ccall(maybeVPNConfigCmd),

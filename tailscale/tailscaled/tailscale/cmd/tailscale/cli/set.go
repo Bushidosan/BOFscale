@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -24,7 +24,6 @@ import (
 	"tailscale.com/safesocket"
 	"tailscale.com/tsconst"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/set"
 	"tailscale.com/version"
@@ -63,6 +62,7 @@ type setArgsT struct {
 	updateCheck                bool
 	updateApply                bool
 	reportPosture              bool
+	remoteConfig               bool
 	snat                       bool
 	statefulFiltering          bool
 	sync                       bool
@@ -78,7 +78,7 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf.BoolVar(&setArgs.acceptRoutes, "accept-routes", acceptRouteDefault(goos), "accept routes advertised by other Tailscale nodes")
 	setf.BoolVar(&setArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
 	setf.StringVar(&setArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP, base name, or auto:any) for internet traffic, or empty string to not use an exit node")
-	setf.BoolVar(&setArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
+	setf.BoolVar(&setArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "allow direct access to the local network when routing traffic via an exit node")
 	setf.BoolVar(&setArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
 	setf.BoolVar(&setArgs.runSSH, "ssh", false, "run an SSH server, permitting access per tailnet admin's declared policy")
 	setf.StringVar(&setArgs.hostname, "hostname", "", "hostname to use instead of the one provided by the OS")
@@ -89,6 +89,7 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf.BoolVar(&setArgs.updateApply, "auto-update", false, "automatically update to the latest available version")
 	setf.BoolVar(&setArgs.reportPosture, "report-posture", false, "allow management plane to gather device posture information")
 	setf.BoolVar(&setArgs.runWebClient, "webclient", false, "expose the web interface for managing this node over Tailscale at port 5252")
+	setf.BoolVar(&setArgs.remoteConfig, "remote-config", false, hidden+"delegate FULL remote control of this node's prefs and LocalAPI to the tailnet admin, bypassing Tailscale's per-feature double opt-in; only use when the tailnet admin owns or is fully trusted with this machine")
 	setf.BoolVar(&setArgs.sync, "sync", false, hidden+"actively sync configuration from the control plane (set to false only for network failure testing)")
 	setf.StringVar(&setArgs.relayServerPort, "relay-server-port", "", "UDP port number (0 will pick a random unused port) for the relay server to bind to, on all interfaces, or empty string to disable relay server functionality")
 	setf.StringVar(&setArgs.relayServerStaticEndpoints, "relay-server-static-endpoints", "", "static IP:port endpoints to advertise as candidates for relay connections (comma-separated, e.g. \"[2001:db8::1]:40000,192.0.2.1:40000\") or empty string to not advertise any static endpoints")
@@ -164,6 +165,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 				Advertise: setArgs.advertiseConnector,
 			},
 			PostureChecking:     setArgs.reportPosture,
+			RemoteConfig:        setArgs.remoteConfig,
 			NoStatefulFiltering: opt.NewBool(!setArgs.statefulFiltering),
 		},
 	}
@@ -184,8 +186,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 			maskedPrefs.AutoExitNode = expr
 			maskedPrefs.AutoExitNodeSet = true
 		} else if err := maskedPrefs.Prefs.SetExitNodeIP(setArgs.exitNodeIP, st); err != nil {
-			var e ipn.ExitNodeLocalIPError
-			if errors.As(err, &e) {
+			if _, ok := errors.AsType[ipn.ExitNodeLocalIPError](err); ok {
 				return fmt.Errorf("%w; did you mean --advertise-exit-node?", err)
 			}
 			return err
@@ -193,9 +194,7 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 
 	warnOnAdvertiseRoutes(ctx, &maskedPrefs.Prefs)
-	if err := checkExitNodeRisk(ctx, &maskedPrefs.Prefs, setArgs.acceptedRisks); err != nil {
-		return err
-	}
+
 	var advertiseExitNodeSet, advertiseRoutesSet bool
 	setFlagSet.Visit(func(f *flag.Flag) {
 		updateMaskedPrefsFromUpOrSetFlag(maskedPrefs, f.Name)
@@ -249,13 +248,13 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 		if err != nil {
 			return fmt.Errorf("failed to set relay server port: %v", err)
 		}
-		maskedPrefs.Prefs.RelayServerPort = ptr.To(uint16(uport))
+		maskedPrefs.Prefs.RelayServerPort = new(uint16(uport))
 	}
 
 	if setArgs.relayServerStaticEndpoints != "" {
 		endpointsSet := make(set.Set[netip.AddrPort])
-		endpointsSplit := strings.Split(setArgs.relayServerStaticEndpoints, ",")
-		for _, s := range endpointsSplit {
+		endpointsSplit := strings.SplitSeq(setArgs.relayServerStaticEndpoints, ",")
+		for s := range endpointsSplit {
 			ap, err := netip.ParseAddrPort(s)
 			if err != nil {
 				return fmt.Errorf("failed to set relay server static endpoints: %q is not a valid IP:port", s)
@@ -269,6 +268,11 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 
 	checkPrefs := curPrefs.Clone()
 	checkPrefs.ApplyEdits(maskedPrefs)
+	// We want to make sure user is aware setting --snat-subnet-routes=false with --advertise-exit-node would break exitnode,
+	// but we won't prevent them from doing it since there are current dependencies on that combination. (as of 2026-03-25)
+	if checkPrefs.NoSNAT && checkPrefs.AdvertisesExitNode() {
+		warnf("--snat-subnet-routes=false is set with --advertise-exit-node; internet traffic through this exit node may not work as expected")
+	}
 	if err := localClient.CheckPrefs(ctx, checkPrefs); err != nil {
 		return err
 	}

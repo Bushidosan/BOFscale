@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 
 	"go.uber.org/zap"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	kube "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
 )
@@ -53,7 +55,7 @@ type ServiceMonitorSpec struct {
 	JobLabel string `json:"jobLabel"`
 	// NamespaceSelector selects the namespace of Service(s) that this ServiceMonitor allows to scrape.
 	// https://github.com/prometheus-operator/prometheus-operator/blob/bb4514e0d5d69f20270e29cfd4ad39b87865ccdf/pkg/apis/monitoring/v1/servicemonitor_types.go#L88
-	NamespaceSelector ServiceMonitorNamespaceSelector `json:"namespaceSelector,omitempty"`
+	NamespaceSelector ServiceMonitorNamespaceSelector `json:"namespaceSelector"`
 	// Selector is the label selector for Service(s) that this ServiceMonitor allows to scrape.
 	// https://github.com/prometheus-operator/prometheus-operator/blob/bb4514e0d5d69f20270e29cfd4ad39b87865ccdf/pkg/apis/monitoring/v1/servicemonitor_types.go#L85
 	Selector metav1.LabelSelector `json:"selector"`
@@ -226,13 +228,13 @@ func metricsResourceLabels(opts *metricsOpts) map[string]string {
 		kubetypes.LabelManaged:   "true",
 		labelMetricsTarget:       opts.proxyStsName,
 		labelPromProxyType:       opts.proxyType,
-		labelPromProxyParentName: opts.proxyLabels[LabelParentName],
+		labelPromProxyParentName: kube.TruncateLabelValue(opts.proxyLabels[LabelParentName]),
 	}
 	// Include namespace label for proxies created for a namespaced type.
 	if isNamespacedProxyType(opts.proxyType) {
-		lbls[labelPromProxyParentNamespace] = opts.proxyLabels[LabelParentNamespace]
+		lbls[labelPromProxyParentNamespace] = kube.TruncateLabelValue(opts.proxyLabels[LabelParentNamespace])
 	}
-	lbls[labelPromJob] = promJobName(opts)
+	lbls[labelPromJob] = kube.TruncateLabelValue(promJobName(opts))
 	return lbls
 }
 
@@ -249,11 +251,11 @@ func promJobName(opts *metricsOpts) string {
 func metricsSvcSelector(proxyLabels map[string]string, proxyType string) map[string]string {
 	sel := map[string]string{
 		labelPromProxyType:       proxyType,
-		labelPromProxyParentName: proxyLabels[LabelParentName],
+		labelPromProxyParentName: kube.TruncateLabelValue(proxyLabels[LabelParentName]),
 	}
 	// Include namespace label for proxies created for a namespaced type.
 	if isNamespacedProxyType(proxyType) {
-		sel[labelPromProxyParentNamespace] = proxyLabels[LabelParentNamespace]
+		sel[labelPromProxyParentNamespace] = kube.TruncateLabelValue(proxyLabels[LabelParentNamespace])
 	}
 	return sel
 }
@@ -286,11 +288,7 @@ func isNamespacedProxyType(typ string) bool {
 
 func mergeMapKeys(a, b map[string]string) map[string]string {
 	m := make(map[string]string, len(a)+len(b))
-	for key, val := range b {
-		m[key] = val
-	}
-	for key, val := range a {
-		m[key] = val
-	}
+	maps.Copy(m, b)
+	maps.Copy(m, a)
 	return m
 }

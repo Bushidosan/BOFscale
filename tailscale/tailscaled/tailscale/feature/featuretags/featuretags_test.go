@@ -1,11 +1,14 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package featuretags
 
 import (
 	"maps"
+	"os/exec"
+	"regexp"
 	"slices"
+	"strings"
 	"testing"
 
 	"tailscale.com/util/set"
@@ -80,6 +83,40 @@ func TestRequiredBy(t *testing.T) {
 		got := RequiredBy(tt.in)
 		if !maps.Equal(got, tt.want) {
 			t.Errorf("FeaturesWhichDependOn(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// Verify that all "ts_omit_foo" build tags are declared in featuretags.go
+func TestAllOmitBuildTagsDeclared(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not found in PATH; skipping test")
+	}
+	root, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		t.Skipf("not in a git repository; skipping test")
+	}
+
+	cmd := exec.Command("git", "grep", "ts_omit_")
+	cmd.Dir = strings.TrimSpace(string(root))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git grep failed: %v\nOutput:\n%s", err, out)
+	}
+	rx := regexp.MustCompile(`\bts_omit_[\w_]+\b`)
+	found := set.Set[string]{}
+	rx.ReplaceAllFunc(out, func(tag []byte) []byte {
+		tagStr := string(tag)
+		found.Add(tagStr)
+		return tag
+	})
+	for tag := range found {
+		if strings.EqualFold(tag, "ts_omit_foo") {
+			continue
+		}
+		ft := FeatureTag(strings.TrimPrefix(tag, "ts_omit_"))
+		if _, ok := Features[ft]; !ok {
+			t.Errorf("found undeclared ts_omit_* build tags: %v", tag)
 		}
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package typewalk provides utilities to walk Go types using reflection.
@@ -54,14 +54,13 @@ func MatchingPaths(rt reflect.Type, match func(reflect.Type) bool) iter.Seq[Path
 				return
 			}
 			switch t.Kind() {
-			case reflect.Ptr, reflect.Slice, reflect.Array:
+			case reflect.Pointer, reflect.Slice, reflect.Array:
 				walk(t.Elem(), func(root reflect.Value) reflect.Value {
 					v := getV(root)
 					return v.Elem()
 				})
 			case reflect.Struct:
-				for i := range t.NumField() {
-					sf := t.Field(i)
+				for sf := range t.Fields() {
 					fieldName := sf.Name
 					if fieldName == "_" {
 						continue

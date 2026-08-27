@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,11 +19,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/yaml"
+
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/ingressservices"
 	"tailscale.com/kube/kubetypes"
-	"tailscale.com/types/ptr"
 )
 
 const (
@@ -74,10 +75,10 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 	}
 	// Validate some base assumptions.
 	if len(ss.Spec.Template.Spec.InitContainers) != 1 {
-		return nil, fmt.Errorf("[unexpected] base proxy config had %d init containers instead of 1", len(ss.Spec.Template.Spec.InitContainers))
+		return nil, fmt.Errorf("base proxy config had %d init containers instead of 1", len(ss.Spec.Template.Spec.InitContainers))
 	}
 	if len(ss.Spec.Template.Spec.Containers) != 1 {
-		return nil, fmt.Errorf("[unexpected] base proxy config had %d containers instead of 1", len(ss.Spec.Template.Spec.Containers))
+		return nil, fmt.Errorf("base proxy config had %d containers instead of 1", len(ss.Spec.Template.Spec.Containers))
 	}
 
 	// StatefulSet config.
@@ -87,7 +88,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 		Labels:          pgLabels(pg.Name, nil),
 		OwnerReferences: pgOwnerReference(pg),
 	}
-	ss.Spec.Replicas = ptr.To(pgReplicas(pg))
+	ss.Spec.Replicas = new(pgReplicas(pg))
 	ss.Spec.Selector = &metav1.LabelSelector{
 		MatchLabels: pgLabels(pg.Name, nil),
 	}
@@ -98,7 +99,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 		Name:                       pg.Name,
 		Namespace:                  namespace,
 		Labels:                     pgLabels(pg.Name, nil),
-		DeletionGracePeriodSeconds: ptr.To[int64](10),
+		DeletionGracePeriodSeconds: new(int64(10)),
 	}
 	tmpl.Spec.ServiceAccountName = pg.Name
 	tmpl.Spec.InitContainers[0].Image = image
@@ -174,6 +175,10 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 				Value: "$(POD_NAME)",
 			},
 			{
+				Name:  "TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT",
+				Value: "false",
+			},
+			{
 				// TODO(tomhjp): This is tsrecorder-specific and does nothing. Delete.
 				Name:  "TS_STATE",
 				Value: "kube:$(POD_NAME)",
@@ -181,6 +186,14 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 			{
 				Name:  "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR",
 				Value: "/etc/tsconfig/$(POD_NAME)",
+			},
+			{
+				// This ensures that cert renewals can succeed if ACME account
+				// keys have changed since issuance. We cannot guarantee or
+				// validate that the account key has not changed, see
+				// https://github.com/tailscale/tailscale/issues/18251
+				Name:  "TS_DEBUG_ACME_FORCE_RENEWAL",
+				Value: "true",
 			},
 		}
 
@@ -270,7 +283,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 		}
 		// Set the deletion grace period to 6 minutes to ensure that the pre-stop hook has enough time to terminate
 		// gracefully.
-		ss.Spec.Template.DeletionGracePeriodSeconds = ptr.To(deletionGracePeriodSeconds)
+		ss.Spec.Template.DeletionGracePeriodSeconds = new(deletionGracePeriodSeconds)
 	}
 
 	return ss, nil
@@ -285,7 +298,7 @@ func kubeAPIServerStatefulSet(pg *tsapi.ProxyGroup, namespace, image string, por
 			OwnerReferences: pgOwnerReference(pg),
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: ptr.To(pgReplicas(pg)),
+			Replicas: new(pgReplicas(pg)),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: pgLabels(pg.Name, nil),
 			},
@@ -294,7 +307,7 @@ func kubeAPIServerStatefulSet(pg *tsapi.ProxyGroup, namespace, image string, por
 					Name:                       pg.Name,
 					Namespace:                  namespace,
 					Labels:                     pgLabels(pg.Name, nil),
-					DeletionGracePeriodSeconds: ptr.To[int64](10),
+					DeletionGracePeriodSeconds: new(int64(10)),
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: pgServiceAccountName(pg),
@@ -346,6 +359,14 @@ func kubeAPIServerStatefulSet(pg *tsapi.ProxyGroup, namespace, image string, por
 											Namespace: namespace,
 											Name:      "$(POD_NAME)-config",
 										}.String(),
+									},
+									{
+										// This ensures that cert renewals can succeed if ACME account
+										// keys have changed since issuance. We cannot guarantee or
+										// validate that the account key has not changed, see
+										// https://github.com/tailscale/tailscale/issues/18251
+										Name:  "TS_DEBUG_ACME_FORCE_RENEWAL",
+										Value: "true",
 									},
 								}
 
@@ -525,9 +546,7 @@ func pgSecretLabels(pgName, secretType string) map[string]string {
 
 func pgLabels(pgName string, customLabels map[string]string) map[string]string {
 	labels := make(map[string]string, len(customLabels)+3)
-	for k, v := range customLabels {
-		labels[k] = v
-	}
+	maps.Copy(labels, customLabels)
 
 	labels[kubetypes.LabelManaged] = "true"
 	labels[LabelParentType] = "proxygroup"

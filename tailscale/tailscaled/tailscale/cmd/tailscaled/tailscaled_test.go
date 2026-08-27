@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package main // import "tailscale.com/cmd/tailscaled"
@@ -58,7 +58,7 @@ func TestStateStoreError(t *testing.T) {
 	args.statedir = t.TempDir()
 	args.tunname = "userspace-networking"
 
-	t.Run("new state", func(t *testing.T) {
+	t.Run("new-state", func(t *testing.T) {
 		sys := tsd.NewSystem()
 		sys.NetMon.Set(must.Get(netmon.New(sys.Bus.Get(), t.Logf)))
 		lb, err := getLocalBackend(t.Context(), t.Logf, logID.Public(), sys)
@@ -70,7 +70,7 @@ func TestStateStoreError(t *testing.T) {
 			t.Errorf("StateStoreHealth is unhealthy on fresh LocalBackend:\n%s", strings.Join(lb.HealthTracker().Strings(), "\n"))
 		}
 	})
-	t.Run("corrupt state", func(t *testing.T) {
+	t.Run("corrupt-state", func(t *testing.T) {
 		sys := tsd.NewSystem()
 		sys.NetMon.Set(must.Get(netmon.New(sys.Bus.Get(), t.Logf)))
 		// Populate the state file with something that will fail to parse to
@@ -87,4 +87,57 @@ func TestStateStoreError(t *testing.T) {
 			t.Errorf("StateStoreHealth is healthy when state file is corrupt")
 		}
 	})
+}
+
+func TestIsPortableStore(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{
+			name: "kube_store",
+			path: "kube:my-secret",
+			want: true,
+		},
+		{
+			name: "aws_arn_store",
+			path: "arn:aws:ssm:us-east-1:123456789012:parameter/tailscale/state",
+			want: true,
+		},
+		{
+			name: "tpm_store",
+			path: "tpmseal:/var/lib/tailscale/tailscaled.state",
+			want: false,
+		},
+		{
+			name: "local_file_store",
+			path: "/var/lib/tailscale/tailscaled.state",
+			want: false,
+		},
+		{
+			name: "empty_path",
+			path: "",
+			want: false,
+		},
+		{
+			name: "mem_store",
+			path: "mem:",
+			want: true,
+		},
+		{
+			name: "windows_file_store",
+			path: `C:\ProgramData\Tailscale\server-state.conf`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isPortableStore(tt.path)
+			if got != tt.want {
+				t.Errorf("isPortableStore(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package vet is a tool to statically check Go source code.
@@ -9,6 +9,8 @@ import (
 
 	"golang.org/x/tools/go/analysis/unitchecker"
 	"tailscale.com/cmd/vet/jsontags"
+	"tailscale.com/cmd/vet/lowerell"
+	"tailscale.com/cmd/vet/subtestnames"
 )
 
 //go:embed jsontags_allowlist
@@ -20,5 +22,5 @@ func init() {
 }
 
 func main() {
-	unitchecker.Main(jsontags.Analyzer)
+	unitchecker.Main(jsontags.Analyzer, lowerell.Analyzer, subtestnames.Analyzer)
 }

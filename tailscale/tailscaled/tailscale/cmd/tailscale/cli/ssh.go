@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -11,9 +11,9 @@ import (
 	"log"
 	"net/netip"
 	"os"
-	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
@@ -58,11 +58,7 @@ func runSSH(ctx context.Context, args []string) error {
 	username, host, ok := strings.Cut(arg, "@")
 	if !ok {
 		host = arg
-		lu, err := user.Current()
-		if err != nil {
-			return nil
-		}
-		username = lu.Username
+		username = ""
 	}
 
 	st, err := localClient.Status(ctx)
@@ -145,7 +141,11 @@ func runSSH(ctx context.Context, args []string) error {
 	// to use a different one, we'll later be making stock ssh
 	// work well by default too. (doing things like automatically
 	// setting known_hosts, etc)
-	argv = append(argv, username+"@"+hostForSSH)
+	if username == "" {
+		argv = append(argv, hostForSSH)
+	} else {
+		argv = append(argv, username+"@"+hostForSSH)
+	}
 
 	argv = append(argv, argRest...)
 
@@ -202,10 +202,8 @@ func peerStatusFromArg(st *ipnstate.Status, arg string) (*ipnstate.PeerStatus, b
 	argIP, _ := netip.ParseAddr(arg)
 	for _, ps := range st.Peer {
 		if argIP.IsValid() {
-			for _, ip := range ps.TailscaleIPs {
-				if ip == argIP {
-					return ps, true
-				}
+			if slices.Contains(ps.TailscaleIPs, argIP) {
+				return ps, true
 			}
 			continue
 		}
@@ -230,10 +228,8 @@ func nodeDNSNameFromArg(st *ipnstate.Status, arg string) (dnsName string, ok boo
 	for _, ps := range st.Peer {
 		dnsName = ps.DNSName
 		if argIP.IsValid() {
-			for _, ip := range ps.TailscaleIPs {
-				if ip == argIP {
-					return dnsName, true
-				}
+			if slices.Contains(ps.TailscaleIPs, argIP) {
+				return dnsName, true
 			}
 			continue
 		}

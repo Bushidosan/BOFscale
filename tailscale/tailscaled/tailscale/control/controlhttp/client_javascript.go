@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlhttp
@@ -23,7 +23,6 @@ var httpClient *http.Client
 // Variant of Dial that tunnels the request over WebSockets, since we cannot do
 // bi-directional communication over an HTTP connection when in JS.
 func (d *Dialer) DialJS(ctx context.Context) (*ClientConn, error) {
-
 	if httpClient == nil {
 		transport := &http.Transport{
 			Proxy: tshttpproxy.ProxyFromEnvironment,
@@ -47,7 +46,9 @@ func (d *Dialer) DialJS(ctx context.Context) (*ClientConn, error) {
 	host := d.Hostname
 	// If using a custom control server (on a non-standard port), prefer that.
 	// This mirrors the port selection in newNoiseClient from noise.go.
-	if d.HTTPPort != "" && d.HTTPPort != "80" && d.HTTPSPort == "443" {
+	// Also use ws:// when HTTPS is explicitly disabled (NoPort), which happens
+	// for http:// URLs with private hostnames (e.g. http://localhost:31544).
+	if d.HTTPPort != "" && d.HTTPPort != "80" && (d.HTTPSPort == "443" || d.HTTPSPort == NoPort) {
 		wsScheme = "ws"
 		host = net.JoinHostPort(host, d.HTTPPort)
 	}

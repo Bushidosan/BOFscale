@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -6,11 +6,14 @@ package cli
 import (
 	"bytes"
 	stdcmp "cmp"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,12 +23,14 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/envknob"
 	"tailscale.com/health/healthmsg"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/deptest"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
@@ -765,7 +770,22 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			args: upArgsT{
 				exitNodeIP: "foo",
 			},
-			wantErr: `invalid value "foo" for --exit-node; must be IP or unique node name`,
+			st: &ipnstate.Status{
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:      "example.com.",
+						TailscaleIPs: []netip.Addr{netip.MustParseAddr("1.0.0.2")},
+					},
+				},
+			},
+			wantErr: `invalid value "foo" for --exit-node; must be IP or peer hostname`,
+		},
+		{
+			name: "error_exit_node_not_started",
+			args: upArgsT{
+				exitNodeIP: "foo",
+			},
+			wantErr: `cannot resolve exit node by hostname while Tailscale is starting up; please use its Tailscale IP address instead`,
 		},
 		{
 			name: "error_exit_node_allow_lan_without_exit_node",
@@ -775,11 +795,43 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			wantErr: `--exit-node-allow-lan-access can only be used with --exit-node`,
 		},
 		{
-			name: "error_tag_prefix",
+			name: "error_tag_bad_prefix",
 			args: upArgsT{
-				advertiseTags: "foo",
+				advertiseTags: "notatag:foo",
 			},
-			wantErr: `tag: "foo": tags must start with 'tag:'`,
+			wantErr: `tag: "notatag:foo": tags must start with 'tag:'`,
+		},
+		{
+			name: "tag_auto_prefix",
+			args: upArgsFromOSArgs("linux", "--advertise-tags=foo,bar"),
+			want: &ipn.Prefs{
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				AdvertiseTags:       []string{"tag:foo", "tag:bar"},
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
+		},
+		{
+			name: "tag_mixed_prefix",
+			args: upArgsFromOSArgs("linux", "--advertise-tags=tag:foo,bar"),
+			want: &ipn.Prefs{
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				AdvertiseTags:       []string{"tag:foo", "tag:bar"},
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
 		},
 		{
 			name: "error_long_hostname",
@@ -958,15 +1010,12 @@ func TestPrefFlagMapping(t *testing.T) {
 	}
 
 	prefType := reflect.TypeFor[ipn.Prefs]()
-	for i := range prefType.NumField() {
-		prefName := prefType.Field(i).Name
+	for field := range prefType.Fields() {
+		prefName := field.Name
 		if prefHasFlag[prefName] {
 			continue
 		}
 		switch prefName {
-		case "AllowSingleHosts":
-			// Fake pref for downgrade compat. See #12058.
-			continue
 		case "WantRunning", "Persist", "LoggedOut":
 			// All explicitly handled (ignored) by checkForAccidentalSettingReverts.
 			continue
@@ -1529,13 +1578,13 @@ func TestParseNLArgs(t *testing.T) {
 			parseDisablements: true,
 		},
 		{
-			name:      "key no votes",
+			name:      "key-no-votes",
 			input:     []string{"nlpub:" + strings.Repeat("00", 32)},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 1, Public: bytes.Repeat([]byte{0}, 32)}},
 		},
 		{
-			name:      "key with votes",
+			name:      "key-with-votes",
 			input:     []string{"nlpub:" + strings.Repeat("01", 32) + "?5"},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 5, Public: bytes.Repeat([]byte{1}, 32)}},
@@ -1547,13 +1596,13 @@ func TestParseNLArgs(t *testing.T) {
 			wantDisablements:  [][]byte{bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)},
 		},
 		{
-			name:      "disablements not allowed",
+			name:      "disablements-not-allowed",
 			input:     []string{"disablement:" + strings.Repeat("02", 32)},
 			parseKeys: true,
 			wantErr:   fmt.Errorf("parsing key 1: key hex string doesn't have expected type prefix tlpub:"),
 		},
 		{
-			name:              "keys not allowed",
+			name:              "keys-not-allowed",
 			input:             []string{"nlpub:" + strings.Repeat("02", 32)},
 			parseDisablements: true,
 			wantErr:           fmt.Errorf("parsing argument 1: expected value with \"disablement:\" or \"disablement-secret:\" prefix, got %q", "nlpub:0202020202020202020202020202020202020202020202020202020202020202"),
@@ -1562,7 +1611,7 @@ func TestParseNLArgs(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			keys, disablements, err := parseNLArgs(tc.input, tc.parseKeys, tc.parseDisablements)
+			keys, disablements, err := parseTLArgs(tc.input, tc.parseKeys, tc.parseDisablements)
 			if (tc.wantErr == nil && err != nil) ||
 				(tc.wantErr != nil && err == nil) ||
 				(tc.wantErr != nil && err != nil && tc.wantErr.Error() != err.Error()) {
@@ -1614,7 +1663,7 @@ func TestNoDups(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := newRootCmd()
+			cmd := newRootCmd(t)
 			makeQuietContinueOnError(cmd)
 			err := cmd.Parse(tt.args)
 			if got := fmt.Sprint(err); got != tt.want {
@@ -1696,6 +1745,78 @@ func TestDocs(t *testing.T) {
 	walk(t, root)
 }
 
+func TestUpResolves(t *testing.T) {
+	const testARN = "arn:aws:ssm:us-east-1:123456789012:parameter/my-parameter"
+	undo := tailscale.HookResolveValueFromParameterStore.SetForTest(func(_ context.Context, valueOrARN string) (string, error) {
+		if valueOrARN == testARN {
+			return "resolved-value", nil
+		}
+		return valueOrARN, nil
+	})
+	defer undo()
+
+	const content = "file-content"
+	fpath := filepath.Join(t.TempDir(), "testfile")
+	if err := os.WriteFile(fpath, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{"parameter_store", testARN, "resolved-value"},
+		{"file", "file:" + fpath, "file-content"},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name+"_auth_key", func(t *testing.T) {
+			args := upArgsT{authKeyOrFile: tt.arg}
+			got, err := args.getAuthKey(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+
+		t.Run(tt.name+"_client_secret", func(t *testing.T) {
+			args := upArgsT{clientSecretOrFile: tt.arg}
+			got, err := args.getClientSecret(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+
+		t.Run(tt.name+"_id_token", func(t *testing.T) {
+			args := upArgsT{idTokenOrFile: tt.arg}
+			got, err := args.getIDToken(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("passthrough", func(t *testing.T) {
+		args := upArgsT{authKeyOrFile: "tskey-abcd1234"}
+		got, err := args.getAuthKey(t.Context())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "tskey-abcd1234" {
+			t.Errorf("got %q, want %q", got, "tskey-abcd1234")
+		}
+	})
+}
+
 func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
@@ -1722,4 +1843,22 @@ func TestDepsNoCapture(t *testing.T) {
 		},
 	}.Check(t)
 
+}
+
+func TestSanitizeWriter(t *testing.T) {
+	buf := new(bytes.Buffer)
+	w := sanitizeOutput(buf)
+
+	in := []byte(`my auth key is tskey-auth-abc123-def456 and tskey-foo, what's yours?`)
+	want := []byte(`my auth key is tskey-XXXXXXXXXXXXXXXXXX and tskey-XXX, what's yours?`)
+	n, err := w.Write(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(in) {
+		t.Errorf("unexpected write length %d, want %d", n, len(in))
+	}
+	if got := buf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("unexpected sanitized content\ngot: %q\nwant: %q", got, want)
+	}
 }

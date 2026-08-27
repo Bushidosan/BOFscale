@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The tsidp command is an OpenID Connect Identity Provider server.
@@ -1403,7 +1403,7 @@ func readUint64(r io.Reader) (uint64, error) {
 	}
 }
 
-// rsaPrivateKeyJSONWrapper is the the JSON serialization
+// rsaPrivateKeyJSONWrapper is the JSON serialization
 // format used by RSAPrivateKey.
 type rsaPrivateKeyJSONWrapper struct {
 	Key string

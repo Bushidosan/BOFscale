@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package relayserver registers the relay server feature and implements its
@@ -23,7 +23,6 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/wgengine/magicsock"
@@ -70,7 +69,7 @@ func servePeerRelayDebugSessions(h *localapi.Handler, w http.ResponseWriter, r *
 func newExtension(logf logger.Logf, sb ipnext.SafeBackend) (ipnext.Extension, error) {
 	e := &extension{
 		newServerFn: func(logf logger.Logf, port uint16, onlyStaticAddrPorts bool) (relayServer, error) {
-			return udprelay.NewServer(logf, port, onlyStaticAddrPorts)
+			return udprelay.NewServer(logf, port, onlyStaticAddrPorts, sb.Sys().UserMetricsRegistry(), sb.Sys().ControlKnobs())
 		},
 		logf: logger.WithPrefix(logf, featureName+": "),
 	}
@@ -225,7 +224,7 @@ func (e *extension) profileStateChanged(_ ipn.LoginProfileView, prefs ipn.PrefsV
 		e.stopRelayServerLocked()
 		e.port = nil
 		if ok {
-			e.port = ptr.To(newPort)
+			e.port = new(newPort)
 		}
 	}
 	e.handleRelayServerLifetimeLocked()
@@ -264,7 +263,7 @@ func (e *extension) serverStatus() status.ServerStatus {
 	if e.rs == nil {
 		return st
 	}
-	st.UDPPort = ptr.To(*e.port)
+	st.UDPPort = new(*e.port)
 	st.Sessions = e.rs.GetSessions()
 	return st
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Program tl-longchain prints commands to re-sign Tailscale nodes that have
@@ -45,7 +45,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	st, err := lc.NetworkLockStatus(ctx)
+	st, err := lc.TailnetLockStatus(ctx)
 	if err != nil {
 		log.Fatalf("could not get Tailnet Lock status: %v", err)
 	}

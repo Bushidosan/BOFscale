@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -14,7 +14,7 @@ import (
 )
 
 func TestFilterFormatAndSortExitNodes(t *testing.T) {
-	t.Run("without filter", func(t *testing.T) {
+	t.Run("without-filter", func(t *testing.T) {
 		ps := []*ipnstate.PeerStatus{
 			{
 				HostName: "everest-1",
@@ -139,7 +139,7 @@ func TestFilterFormatAndSortExitNodes(t *testing.T) {
 		}
 	})
 
-	t.Run("with country filter", func(t *testing.T) {
+	t.Run("with-country-filter", func(t *testing.T) {
 		ps := []*ipnstate.PeerStatus{
 			{
 				HostName: "baker-1",

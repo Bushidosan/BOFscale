@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build js || windows || linux || darwin
@@ -33,7 +33,6 @@ func init() {
 }
 
 func dialWebsocket(ctx context.Context, urlStr string) (net.Conn, error) {
-
 	c, res, err := websocket.Dial(ctx, urlStr, &websocket.DialOptions{
 		Subprotocols: []string{"derp"},
 		HTTPClient:   httpClient,

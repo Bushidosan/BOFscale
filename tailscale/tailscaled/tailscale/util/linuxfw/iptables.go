@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !ts_omit_iptables
@@ -21,8 +21,8 @@ import (
 
 func init() {
 	isNotExistError = func(err error) bool {
-		var e *iptables.Error
-		return errors.As(err, &e) && e.IsNotExist()
+		e, ok := errors.AsType[*iptables.Error](err)
+		return ok && e.IsNotExist()
 	}
 }
 

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tsconsensus
@@ -296,7 +296,7 @@ func startNodesAndWaitForPeerStatus(t testing.TB, ctx context.Context, clusterTa
 	keysToTag := make([]key.NodePublic, nNodes)
 	localClients := make([]*tailscale.LocalClient, nNodes)
 	control, controlURL := startControl(t)
-	for i := 0; i < nNodes; i++ {
+	for i := range nNodes {
 		ts, key, _ := startNode(t, ctx, controlURL, fmt.Sprintf("node %d", i))
 		ps[i] = &participant{ts: ts, key: key}
 		keysToTag[i] = key
@@ -353,7 +353,7 @@ func createConsensusCluster(t testing.TB, ctx context.Context, clusterTag string
 	}
 
 	fxRaftConfigContainsAll := func() bool {
-		for i := 0; i < len(participants); i++ {
+		for i := range participants {
 			fut := participants[i].c.raft.GetConfiguration()
 			err = fut.Error()
 			if err != nil {
@@ -618,8 +618,8 @@ func TestOnlyTaggedPeersCanDialRaftPort(t *testing.T) {
 	}
 
 	isNetErr := func(err error) bool {
-		var netErr net.Error
-		return errors.As(err, &netErr)
+		_, ok := errors.AsType[net.Error](err)
+		return ok
 	}
 
 	err := getErrorFromTryingToSend(untaggedNode)
@@ -642,7 +642,7 @@ func TestOnlyTaggedPeersCanBeDialed(t *testing.T) {
 
 	// make a StreamLayer for ps[0]
 	ts := ps[0].ts
-	auth := newAuthorization(ts, clusterTag)
+	auth := newAuthorizationForTest(ts, clusterTag)
 
 	port := 19841
 	lns := make([]net.Listener, 3)
@@ -692,10 +692,12 @@ func TestOnlyTaggedPeersCanBeDialed(t *testing.T) {
 	conn.Close()
 
 	_, err = sl.Dial(a2, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected dial error to untagged node, got none")
+	}
 	if err.Error() != "dial: peer is not allowed" {
 		t.Fatalf("expected dial: peer is not allowed, got: %v", err)
 	}
-
 }
 
 func TestOnlyTaggedPeersCanJoin(t *testing.T) {

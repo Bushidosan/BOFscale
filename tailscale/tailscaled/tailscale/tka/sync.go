@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_tailnetlock
@@ -9,13 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-)
 
-const (
-	// Max iterations searching for any intersection.
-	maxSyncIter = 2000
-	// Max iterations searching for a head intersection.
-	maxSyncHeadIntersectionIter = 400
+	"tailscale.com/util/testenv"
 )
 
 // ErrNoIntersection is returned when a shared AUM could
@@ -107,7 +102,7 @@ func (a *Authority) SyncOffer(storage Chonk) (SyncOffer, error) {
 		skipAmount uint64  = ancestorsSkipStart
 		curs       AUMHash = a.Head()
 	)
-	for i := uint64(0); i < maxSyncHeadIntersectionIter; i++ {
+	for i := range uint64(maxSyncHeadIntersectionIter) {
 		if i > 0 && (i%skipAmount) == 0 {
 			out.Ancestors = append(out.Ancestors, curs)
 			skipAmount = skipAmount << ancestorsSkipShift
@@ -280,4 +275,66 @@ func (a *Authority) MissingAUMs(storage Chonk, remoteOffer SyncOffer) ([]AUM, er
 	}
 
 	panic("unreachable")
+}
+
+// SeedNode is an authority-chonk pair that can be seeded by [SeedAUMs].
+type SeedNode struct {
+	authority *Authority
+	storage   Chonk
+}
+
+// CreateSeedNode creates a node for use with [SeedAUMs].
+func CreateSeedNode(t testenv.TB, authority *Authority, storage Chonk) SeedNode {
+	t.Helper()
+	return SeedNode{authority, storage}
+}
+
+type SeedAUMConfig struct {
+	Count  int
+	Signer Signer
+	Nodes  []SeedNode
+}
+
+// SeedAUMs generates many AUMs by repeatedly adding and removing keys
+// from the TKA.
+//
+// The AUMs are written to all the supplied nodes, so if you pass more
+// than one, you can build up a long sync history.
+//
+// This is only for use in testing.
+func SeedAUMs(t testenv.TB, config SeedAUMConfig) {
+	t.Helper()
+
+	if len(config.Nodes) == 0 {
+		panic("called SeedAUMs without any nodes")
+	}
+	primaryNode := config.Nodes[0]
+
+	// The key that we'll repeatedly add/remove in the TKA.
+	key := Key{Kind: Key25519, Public: []byte{1, 1, 1}, Votes: 1}
+
+	for i := 0; i < config.Count/2; i++ {
+		for _, action := range []string{"add", "remove"} {
+			updater := primaryNode.authority.NewUpdater(config.Signer)
+			if action == "add" {
+				if err := updater.AddKey(key); err != nil {
+					t.Fatalf("error from updater.AddKey: %v")
+				}
+			} else {
+				if err := updater.RemoveKey(key.MustID()); err != nil {
+					t.Fatalf("error from updater.RemoveKey: %v")
+				}
+			}
+			aum, err := updater.Finalize(primaryNode.storage)
+			if err != nil {
+				t.Fatalf("error from authority.Finalize: %v", err)
+			}
+
+			for _, n := range config.Nodes {
+				if err := n.authority.Inform(n.storage, aum); err != nil {
+					t.Fatalf("error from authority.Inform: %v", err)
+				}
+			}
+		}
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -21,11 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	operatorutils "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tstest"
-	"tailscale.com/types/ptr"
 )
 
 func TestDNSRecordsReconciler(t *testing.T) {
@@ -44,7 +46,7 @@ func TestDNSRecordsReconciler(t *testing.T) {
 			Namespace: "test",
 		},
 		Spec: networkingv1.IngressSpec{
-			IngressClassName: ptr.To("tailscale"),
+			IngressClassName: new("tailscale"),
 		},
 		Status: networkingv1.IngressStatus{
 			LoadBalancer: networkingv1.IngressLoadBalancerStatus{
@@ -150,7 +152,7 @@ func TestDNSRecordsReconciler(t *testing.T) {
 
 	// 7. A not-ready Endpoint is removed from DNS config.
 	mustUpdate(t, fc, ep.Namespace, ep.Name, func(ep *discoveryv1.EndpointSlice) {
-		ep.Endpoints[0].Conditions.Ready = ptr.To(false)
+		ep.Endpoints[0].Conditions.Ready = new(false)
 		ep.Endpoints = append(ep.Endpoints, discoveryv1.Endpoint{
 			Addresses: []string{"1.2.3.4"},
 		})
@@ -220,13 +222,13 @@ func TestDNSRecordsReconciler(t *testing.T) {
 		Endpoints: []discoveryv1.Endpoint{{
 			Addresses: []string{"10.1.0.100", "10.1.0.101", "10.1.0.102"}, // Pod IPs that should NOT be used
 			Conditions: discoveryv1.EndpointConditions{
-				Ready:       ptr.To(true),
-				Serving:     ptr.To(true),
-				Terminating: ptr.To(false),
+				Ready:       new(true),
+				Serving:     new(true),
+				Terminating: new(false),
 			},
 		}},
 		Ports: []discoveryv1.EndpointPort{{
-			Port: ptr.To(int32(10443)),
+			Port: new(int32(10443)),
 		}},
 	}
 
@@ -291,6 +293,88 @@ func TestDNSRecordsReconcilerErrorCases(t *testing.T) {
 	}
 }
 
+func TestDNSRecordsReconcilerOptimisticLockError(t *testing.T) {
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := interceptor.Funcs{
+		Update: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			return errors.New(optimisticLockErrorMsg)
+		},
+	}
+
+	dnsCfg := &tsapi.DNSConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "test"},
+		TypeMeta:   metav1.TypeMeta{Kind: "DNSConfig"},
+		Spec:       tsapi.DNSConfigSpec{Nameserver: &tsapi.Nameserver{}},
+	}
+	dnsCfg.Status.Conditions = append(dnsCfg.Status.Conditions, metav1.Condition{
+		Type:   string(tsapi.NameserverReady),
+		Status: metav1.ConditionTrue,
+	})
+
+	egressSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "lock-service",
+			Namespace: "default",
+			Annotations: map[string]string{
+				AnnotationTailnetTargetFQDN: "lock-service.example.ts.net",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:         corev1.ServiceTypeExternalName,
+			ExternalName: "unused",
+		},
+	}
+
+	proxyGroupEgressSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ts-proxygroup-egress-abcd1",
+			Namespace: "tailscale",
+			Labels: map[string]string{
+				kubetypes.LabelManaged: "true",
+				LabelParentName:        "lock-service",
+				LabelParentNamespace:   "default",
+				LabelParentType:        "svc",
+				labelProxyGroup:        "test-proxy-group",
+				labelSvcType:           typeEgress,
+			},
+		},
+	}
+
+	f := fake.NewClientBuilder().
+		WithInterceptorFuncs(funcs).
+		WithScheme(tsapi.GlobalScheme).
+		WithObjects(dnsCfg, proxyGroupEgressSvc, egressSvc).
+		WithStatusSubresource(dnsCfg).
+		Build()
+
+	dnsRR := &dnsRecordsReconciler{
+		Client:      f,
+		tsNamespace: "tailscale",
+		logger:      zl.Sugar(),
+	}
+
+	namespacedName := types.NamespacedName{
+		Namespace: proxyGroupEgressSvc.GetNamespace(),
+		Name:      proxyGroupEgressSvc.GetName(),
+	}
+
+	res, err := dnsRR.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: namespacedName,
+	})
+
+	if err != nil {
+		t.Errorf("expected requeueAfter in result, got error: %s", err)
+	}
+
+	if res.RequeueAfter == 0 {
+		t.Errorf("exptected requeueAfter in result to be > 0, got %d", res.RequeueAfter)
+	}
+}
+
 func TestDNSRecordsReconcilerDualStack(t *testing.T) {
 	// Test dual-stack (IPv4 and IPv6) scenarios
 	zl, err := zap.NewDevelopment()
@@ -316,7 +400,7 @@ func TestDNSRecordsReconcilerDualStack(t *testing.T) {
 			Namespace: "test",
 		},
 		Spec: networkingv1.IngressSpec{
-			IngressClassName: ptr.To("tailscale"),
+			IngressClassName: new("tailscale"),
 		},
 		Status: networkingv1.IngressStatus{
 			LoadBalancer: networkingv1.IngressLoadBalancerStatus{
@@ -447,9 +531,9 @@ func endpointSliceForService(svc *corev1.Service, ip string, fam discoveryv1.Add
 		Endpoints: []discoveryv1.Endpoint{{
 			Addresses: []string{ip},
 			Conditions: discoveryv1.EndpointConditions{
-				Ready:       ptr.To(true),
-				Serving:     ptr.To(true),
-				Terminating: ptr.To(false),
+				Ready:       new(true),
+				Serving:     new(true),
+				Terminating: new(false),
 			},
 		}},
 	}

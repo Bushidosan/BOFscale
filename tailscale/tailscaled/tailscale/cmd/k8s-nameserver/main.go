@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -29,7 +29,7 @@ import (
 const (
 	// tsNetDomain is the domain that this DNS nameserver has registered a handler for.
 	tsNetDomain = "ts.net"
-	// addr is the the address that the UDP and TCP listeners will listen on.
+	// addr is the address that the UDP and TCP listeners will listen on.
 	addr = ":1053"
 	// defaultTTL is the default TTL for DNS records in seconds.
 	// Set to 0 to disable caching. Can be increased when usage patterns are better understood.

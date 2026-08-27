@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tka
@@ -104,22 +104,13 @@ func TestTailchonkFS_IgnoreTempFile(t *testing.T) {
 		}
 	}
 
-	// Check that calling AllAUMs() returns the single committed AUM
-	got, err := chonk.AllAUMs()
-	if err != nil {
-		t.Fatalf("AllAUMs() failed: %v", err)
-	}
-	want := []AUMHash{aum.Hash()}
-	if !slices.Equal(got, want) {
-		t.Fatalf("AllAUMs() is wrong: got %v, want %v", got, want)
-	}
-
 	// Write some temporary files which are named like partially-committed AUMs,
-	// then check that AllAUMs() only returns the single committed AUM.
+	// then check that the initial scan only returns the committed AUM.
 	writeAUMFile("AUM1234.tmp", "incomplete AUM\n")
 	writeAUMFile("AUM1234.tmp_123", "second incomplete AUM\n")
 
-	got, err = chonk.AllAUMs()
+	got, err := chonk.AllAUMs()
+	want := []AUMHash{aum.Hash()}
 	if err != nil {
 		t.Fatalf("AllAUMs() failed: %v", err)
 	}
@@ -165,6 +156,115 @@ func TestTailchonkFS_CannotUseFile(t *testing.T) {
 	}
 }
 
+// Indexed FS reads decode AUMs from disk, so mutable fields in returned values
+// must not alias subsequent results.
+func TestTailchonkFS_ReturnsIndependentAUMs(t *testing.T) {
+	chonk := must.Get(ChonkDir(t.TempDir()))
+	parent := AUM{MessageKind: AUMRemoveKey, KeyID: []byte{0}}
+	parentHash := parent.Hash()
+	child := AUM{MessageKind: AUMRemoveKey, KeyID: []byte{1}, PrevAUMHash: parentHash[:]}
+	must.Do(chonk.CommitVerifiedAUMs([]AUM{parent, child}))
+
+	got := must.Get(chonk.ChildAUMs(parentHash))
+	if len(got) != 1 {
+		t.Fatalf("ChildAUMs() returned %d children, want 1", len(got))
+	}
+	got[0].PrevAUMHash[0] ^= 0xff
+	got[0].KeyID[0] ^= 0xff
+
+	got = must.Get(chonk.ChildAUMs(parentHash))
+	if diff := cmp.Diff([]AUM{child}, got); diff != "" {
+		t.Fatalf("stored child changed through a returned AUM (-want, +got):\n%s", diff)
+	}
+}
+
+func TestTailchonkFS_ConcurrentIndexBuild(t *testing.T) {
+	chonk := must.Get(ChonkDir(t.TempDir()))
+	parent := AUM{MessageKind: AUMRemoveKey, KeyID: []byte{0}}
+	parentHash := parent.Hash()
+	child := AUM{MessageKind: AUMRemoveKey, KeyID: []byte{1}, PrevAUMHash: parentHash[:]}
+	must.Do(chonk.CommitVerifiedAUMs([]AUM{parent, child}))
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range 30 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+
+			switch i % 3 {
+			case 0:
+				if got, err := chonk.ChildAUMs(parentHash); err != nil || len(got) != 1 {
+					t.Errorf("ChildAUMs() = %v, %v; want one child", got, err)
+				}
+			case 1:
+				if got, err := chonk.Heads(); err != nil || len(got) != 1 {
+					t.Errorf("Heads() = %v, %v; want one head", got, err)
+				}
+			case 2:
+				if got, err := chonk.AllAUMs(); err != nil || len(got) != 2 {
+					t.Errorf("AllAUMs() = %v, %v; want two AUMs", got, err)
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
+func BenchmarkTailchonkFSOpenLongChain(b *testing.B) {
+	// Exercise the largest linear AUM history accepted by maxScanIterations.
+	// Generate more history than needed, then retain a prefix so the benchmark
+	// size does not depend on checkpoint cadence.
+	const targetAUMs = maxScanIterations
+
+	signer := key.NewNLPrivate()
+	trustedKey := Key{Kind: Key25519, Public: signer.Public().Verifier(), Votes: 1}
+	storage := ChonkMem()
+	authority, _, err := Create(storage, CreateStateForTest(trustedKey), signer)
+	if err != nil {
+		b.Fatal(err)
+	}
+	SeedAUMs(b, SeedAUMConfig{
+		Count:  targetAUMs,
+		Signer: signer,
+		Nodes:  []SeedNode{CreateSeedNode(b, authority, storage)},
+	})
+
+	// SeedAUMs may insert checkpoints in addition to the requested updates.
+	// Walk from the final head to genesis, reverse the result, and retain
+	// exactly the supported maximum.
+	aums := make([]AUM, 0, targetAUMs)
+	for h := authority.Head(); ; {
+		aum := must.Get(storage.AUM(h))
+		aums = append(aums, aum)
+
+		parent, ok := aum.Parent()
+		if !ok {
+			break
+		}
+		h = parent
+	}
+	slices.Reverse(aums)
+
+	if len(aums) < targetAUMs {
+		b.Fatalf("seeded %d AUMs, want at least %d", len(aums), targetAUMs)
+	}
+	aums = aums[:targetAUMs]
+
+	dir := b.TempDir()
+	fs := must.Get(ChonkDir(dir))
+	must.Do(fs.CommitVerifiedAUMs(aums))
+
+	b.ResetTimer()
+	for b.Loop() {
+		fs := must.Get(ChonkDir(dir))
+		must.Get(Open(fs))
+	}
+	b.ReportMetric(float64(len(aums)), "AUMs")
+}
+
 func TestMarkActiveChain(t *testing.T) {
 	type aumTemplate struct {
 		AUM AUM
@@ -185,7 +285,7 @@ func TestMarkActiveChain(t *testing.T) {
 			expectLastActiveIdx: 0,
 		},
 		{
-			name:     "simple truncate",
+			name:     "simple-truncate",
 			minChain: 2,
 			chain: []aumTemplate{
 				{AUM: AUM{MessageKind: AUMCheckpoint, State: &State{}}},
@@ -196,7 +296,7 @@ func TestMarkActiveChain(t *testing.T) {
 			expectLastActiveIdx: 1,
 		},
 		{
-			name:     "long truncate",
+			name:     "long-truncate",
 			minChain: 5,
 			chain: []aumTemplate{
 				{AUM: AUM{MessageKind: AUMCheckpoint, State: &State{}}},
@@ -211,7 +311,7 @@ func TestMarkActiveChain(t *testing.T) {
 			expectLastActiveIdx: 2,
 		},
 		{
-			name:     "truncate finding checkpoint",
+			name:     "truncate-finding-checkpoint",
 			minChain: 2,
 			chain: []aumTemplate{
 				{AUM: AUM{MessageKind: AUMCheckpoint, State: &State{}}},
@@ -309,17 +409,12 @@ func TestMarkDescendantAUMs(t *testing.T) {
 	}
 	for _, h := range []AUMHash{hs["genesis"], hs["B"], hs["D"]} {
 		if (verdict[h] & retainStateLeaf) != 0 {
-			t.Errorf("%v was marked as a descendant and shouldnt be", h)
+			t.Errorf("%v was marked as a descendant and shouldn't be", h)
 		}
 	}
 }
 
 func TestMarkAncestorIntersectionAUMs(t *testing.T) {
-	fakeState := &State{
-		Keys:               []Key{{Kind: Key25519, Votes: 1}},
-		DisablementSecrets: [][]byte{bytes.Repeat([]byte{1}, 32)},
-	}
-
 	tcs := []struct {
 		name            string
 		chain           *testChain
@@ -333,7 +428,7 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
 			name: "genesis",
 			chain: newTestchain(t, `
                 A
-                A.template = checkpoint`, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState})),
+                A.template = checkpoint`, checkpointTemplate()),
 			initialAncestor: "A",
 			wantAncestor:    "A",
 			verdicts: map[string]retainState{
@@ -342,11 +437,11 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
 			wantRetained: []string{"A"},
 		},
 		{
-			name: "no adjustment",
+			name: "no-adjustment",
 			chain: newTestchain(t, `
                 DEAD -> A -> B -> C
                 A.template = checkpoint
-                B.template = checkpoint`, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState})),
+                B.template = checkpoint`, checkpointTemplate()),
 			initialAncestor: "A",
 			wantAncestor:    "A",
 			verdicts: map[string]retainState{
@@ -366,7 +461,7 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
                 A.template = checkpoint
                 C.template = checkpoint
                 D.template = checkpoint
-                FORK.hashSeed = 2`, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState})),
+                FORK.hashSeed = 2`, checkpointTemplate()),
 			initialAncestor: "D",
 			wantAncestor:    "C",
 			verdicts: map[string]retainState{
@@ -380,14 +475,14 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
 			wantDeleted:  []string{"A", "B"},
 		},
 		{
-			name: "fork finding earlier checkpoint",
+			name: "fork-finding-earlier-checkpoint",
 			chain: newTestchain(t, `
                 A -> B -> C -> D -> E -> F
                           | -> FORK
                 A.template = checkpoint
                 B.template = checkpoint
                 E.template = checkpoint
-                FORK.hashSeed = 2`, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState})),
+                FORK.hashSeed = 2`, checkpointTemplate()),
 			initialAncestor: "E",
 			wantAncestor:    "B",
 			verdicts: map[string]retainState{
@@ -403,7 +498,7 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
 			wantDeleted:  []string{"A"},
 		},
 		{
-			name: "fork multi",
+			name: "fork-multi",
 			chain: newTestchain(t, `
                 A -> B -> C -> D -> E
                                | -> DEADFORK
@@ -413,7 +508,7 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
                 D.template = checkpoint
                 E.template = checkpoint
                 FORK.hashSeed = 2
-                DEADFORK.hashSeed = 3`, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState})),
+                DEADFORK.hashSeed = 3`, checkpointTemplate()),
 			initialAncestor: "D",
 			wantAncestor:    "C",
 			verdicts: map[string]retainState{
@@ -429,7 +524,7 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
 			wantDeleted:  []string{"A", "B", "DEADFORK"},
 		},
 		{
-			name: "fork multi 2",
+			name: "fork-multi-2",
 			chain: newTestchain(t, `
                 A -> B -> C -> D -> E -> F -> G
 
@@ -443,7 +538,7 @@ func TestMarkAncestorIntersectionAUMs(t *testing.T) {
                 F.template = checkpoint
                 F1.hashSeed = 2
                 F2.hashSeed = 3
-                F3.hashSeed = 4`, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState})),
+                F3.hashSeed = 4`, checkpointTemplate()),
 			initialAncestor: "F",
 			wantAncestor:    "B",
 			verdicts: map[string]retainState{
@@ -541,11 +636,6 @@ func cloneMem(src, dst *Mem) {
 }
 
 func TestCompact(t *testing.T) {
-	fakeState := &State{
-		Keys:               []Key{{Kind: Key25519, Votes: 1}},
-		DisablementSecrets: [][]byte{bytes.Repeat([]byte{1}, 32)},
-	}
-
 	// A & B are deleted because the new lastActiveAncestor advances beyond them.
 	// OLD is deleted because it does not match retention criteria, and
 	// though it is a descendant of the new lastActiveAncestor (C), it is not a
@@ -578,7 +668,7 @@ func TestCompact(t *testing.T) {
         F1.hashSeed = 1
         OLD.hashSeed = 2
         G2.hashSeed = 3
-    `, optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState}))
+    `, checkpointTemplate())
 
 	storage := &compactingChonkFake{
 		aumAge:     map[AUMHash]time.Time{(c.AUMHashes["F1"]): time.Now()},
@@ -607,12 +697,10 @@ func TestCompactLongButYoung(t *testing.T) {
 	ourPriv := key.NewNLPrivate()
 	ourKey := Key{Kind: Key25519, Public: ourPriv.Public().Verifier(), Votes: 1}
 	someOtherKey := Key{Kind: Key25519, Public: key.NewNLPrivate().Public().Verifier(), Votes: 1}
+	state := CreateStateForTest(ourKey, someOtherKey)
 
 	storage := ChonkMem()
-	auth, _, err := Create(storage, State{
-		Keys:               []Key{ourKey, someOtherKey},
-		DisablementSecrets: [][]byte{DisablementKDF(bytes.Repeat([]byte{0xa5}, 32))},
-	}, ourPriv)
+	auth, _, err := Create(storage, state, ourPriv)
 	if err != nil {
 		t.Fatalf("tka.Create() failed: %v", err)
 	}

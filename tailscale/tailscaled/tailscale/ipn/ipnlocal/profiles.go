@@ -1,14 +1,16 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
 import (
 	"cmp"
+	"crypto"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"slices"
 	"strings"
@@ -19,7 +21,10 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/persist"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/testenv"
@@ -57,6 +62,13 @@ type profileManager struct {
 	// extHost is the bridge between [profileManager] and the registered [ipnext.Extension]s.
 	// It may be nil in tests. A nil pointer is a valid, no-op host.
 	extHost *ExtensionHost
+
+	// Override for key.NewEmptyHardwareAttestationKey used for testing.
+	newEmptyHardwareAttestationKey func() (key.HardwareAttestationKey, error)
+
+	// clock supplies the current time when stamping LoginProfile.Created.
+	// Tests substitute a fake clock to make creation timestamps deterministic.
+	clock tstime.DefaultClock
 }
 
 // SetExtensionHost sets the [ExtensionHost] for the [profileManager].
@@ -198,16 +210,6 @@ func (pm *profileManager) DefaultUserProfile(uid ipn.WindowsUserID) ipn.LoginPro
 	b, err := pm.store.ReadState(ipn.CurrentProfileKey(string(uid)))
 	pm.dlogf("DefaultUserProfile: ReadState(%q) = %v, %v", string(uid), len(b), err)
 	if err == ipn.ErrStateNotExist || len(b) == 0 {
-		/*
-			if runtime.GOOS == "windows" {
-				pm.dlogf("DefaultUserProfile: windows: migrating from legacy preferences")
-				profile, err := pm.migrateFromLegacyPrefs(uid)
-				if err == nil {
-					return profile
-				}
-				pm.logf("failed to migrate from legacy preferences: %v", err)
-			}
-		*/
 		return pm.NewProfileForUser(uid)
 	}
 
@@ -245,7 +247,14 @@ func (pm *profileManager) allProfilesFor(uid ipn.WindowsUserID) []ipn.LoginProfi
 		}
 	}
 	slices.SortFunc(out, func(a, b ipn.LoginProfileView) int {
-		return cmp.Compare(a.Name(), b.Name())
+		// Legacy (zero Created) first, then stamped oldest-first.
+		if c := a.Created().Compare(b.Created()); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Name(), b.Name()); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.NetworkProfile().DomainName, b.NetworkProfile().DomainName)
 	})
 	return out
 }
@@ -269,7 +278,7 @@ func (pm *profileManager) matchingProfiles(uid ipn.WindowsUserID, f func(ipn.Log
 func (pm *profileManager) findMatchingProfiles(uid ipn.WindowsUserID, prefs ipn.PrefsView) []ipn.LoginProfileView {
 	return pm.matchingProfiles(uid, func(p ipn.LoginProfileView) bool {
 		return p.ControlURL() == prefs.ControlURL() &&
-			(p.UserProfile().ID == prefs.Persist().UserProfile().ID ||
+			(p.UserProfile().ID() == prefs.Persist().UserProfile().ID() ||
 				p.NodeID() == prefs.Persist().NodeID())
 	})
 }
@@ -332,7 +341,7 @@ func (pm *profileManager) setUnattendedModeAsConfigured() error {
 // across user switches to disambiguate the same account but a different tailnet.
 func (pm *profileManager) SetPrefs(prefsIn ipn.PrefsView, np ipn.NetworkProfile) error {
 	cp := pm.currentProfile
-	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName == "" {
+	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName() == "" {
 		// We don't know anything about this profile, so ignore it for now.
 		return pm.setProfilePrefsNoPermCheck(pm.currentProfile, prefsIn.AsStruct().View())
 	}
@@ -405,9 +414,10 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 	// and it hasn't been persisted yet. We'll generate both an ID and [ipn.StateKey]
 	// once the information is available and needs to be persisted.
 	if lp.ID == "" {
-		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName != "" {
+		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName() != "" {
 			// Generate an ID and [ipn.StateKey] now that we have the node info.
 			lp.ID, lp.Key = newUnusedID(pm.knownProfiles)
+			lp.Created = pm.clock.Now()
 		}
 
 		// Set the current user as the profile owner, unless the current user ID does
@@ -420,7 +430,7 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 
 	var up tailcfg.UserProfile
 	if persist := prefsIn.Persist(); persist.Valid() {
-		up = persist.UserProfile()
+		up = *persist.UserProfile().AsStruct()
 		if up.DisplayName == "" {
 			up.DisplayName = up.LoginName
 		}
@@ -657,8 +667,26 @@ func (pm *profileManager) loadSavedPrefs(k ipn.StateKey) (ipn.PrefsView, error) 
 		return ipn.PrefsView{}, err
 	}
 	savedPrefs := ipn.NewPrefs()
+
+	// if supported by the platform, create an empty hardware attestation key to use when deserializing
+	// to avoid type exceptions from json.Unmarshaling into an interface{}.
+	hw, _ := pm.newEmptyHardwareAttestationKey()
+	savedPrefs.Persist = &persist.Persist{
+		AttestationKey: hw,
+	}
+
 	if err := ipn.PrefsFromBytes(bs, savedPrefs); err != nil {
-		return ipn.PrefsView{}, fmt.Errorf("parsing saved prefs: %v", err)
+		// Try loading again, this time ignoring the AttestationKey contents.
+		// If that succeeds, there's something wrong with the underlying
+		// attestation key mechanism (most likely the TPM changed), but we
+		// should at least proceed with client startup.
+		origErr := err
+		savedPrefs.Persist.AttestationKey = &noopAttestationKey{}
+		if err := ipn.PrefsFromBytes(bs, savedPrefs); err != nil {
+			return ipn.PrefsView{}, fmt.Errorf("parsing saved prefs: %w", err)
+		} else {
+			pm.logf("failed to parse savedPrefs with attestation key (error: %v) but parsing without the attestation key succeeded; will proceed without using the old attestation key", origErr)
+		}
 	}
 	pm.logf("using backend prefs for %q: %v", k, savedPrefs.Pretty())
 
@@ -904,11 +932,12 @@ func newProfileManagerWithGOOS(store ipn.StateStore, logf logger.Logf, ht *healt
 	metricProfileCount.Set(int64(len(knownProfiles)))
 
 	pm := &profileManager{
-		goos:          goos,
-		store:         store,
-		knownProfiles: knownProfiles,
-		logf:          logf,
-		health:        ht,
+		goos:                           goos,
+		store:                          store,
+		knownProfiles:                  knownProfiles,
+		logf:                           logf,
+		health:                         ht,
+		newEmptyHardwareAttestationKey: key.NewEmptyHardwareAttestationKey,
 	}
 
 	var initialProfile ipn.LoginProfileView
@@ -977,3 +1006,21 @@ var (
 	metricMigrationError   = clientmetric.NewCounter("profiles_migration_error")
 	metricMigrationSuccess = clientmetric.NewCounter("profiles_migration_success")
 )
+
+// noopAttestationKey is a key.HardwareAttestationKey that always successfully
+// unmarshals as a zero key.
+type noopAttestationKey struct{}
+
+func (n noopAttestationKey) Public() crypto.PublicKey {
+	panic("noopAttestationKey.Public should not be called; missing IsZero check somewhere?")
+}
+
+func (n noopAttestationKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
+	panic("noopAttestationKey.Sign should not be called; missing IsZero check somewhere?")
+}
+
+func (n noopAttestationKey) MarshalJSON() ([]byte, error)      { return nil, nil }
+func (n noopAttestationKey) UnmarshalJSON([]byte) error        { return nil }
+func (n noopAttestationKey) Close() error                      { return nil }
+func (n noopAttestationKey) Clone() key.HardwareAttestationKey { return n }
+func (n noopAttestationKey) IsZero() bool                      { return true }

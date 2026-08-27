@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package router
@@ -15,12 +15,12 @@ func TestConfigEqual(t *testing.T) {
 	testedFields := []string{
 		"LocalAddrs", "Routes", "LocalRoutes", "NewMTU",
 		"SubnetRoutes", "SNATSubnetRoutes", "StatefulFiltering",
-		"NetfilterMode", "NetfilterKind",
+		"NetfilterMode", "NetfilterKind", "RemoveCGNATDropRule",
 	}
 	configType := reflect.TypeFor[Config]()
 	configFields := []string{}
-	for i := range configType.NumField() {
-		configFields = append(configFields, configType.Field(i).Name)
+	for field := range configType.Fields() {
+		configFields = append(configFields, field.Name)
 	}
 	if !reflect.DeepEqual(configFields, testedFields) {
 		t.Errorf("Config.Equal check might be out of sync\nfields: %q\nhandled: %q\n",

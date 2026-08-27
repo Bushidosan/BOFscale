@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmon
@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -138,7 +139,7 @@ func TestMonitorMode(t *testing.T) {
 		n := 0
 		mon.RegisterChangeCallback(func(d *ChangeDelta) {
 			n++
-			t.Logf("cb: changed=%v, ifSt=%v", d.Major, d.New)
+			t.Logf("cb: changed=%v, ifSt=%v", d.RebindLikelyRequired, d.CurrentState())
 		})
 		mon.Start()
 		<-done
@@ -149,24 +150,84 @@ func TestMonitorMode(t *testing.T) {
 		mon.Start()
 		eventbustest.Expect(tw, func(event *ChangeDelta) (bool, error) {
 			n++
-			t.Logf("cb: changed=%v, ifSt=%v", event.Major, event.New)
+			t.Logf("cb: changed=%v, ifSt=%v", event.RebindLikelyRequired, event.CurrentState())
 			return false, nil // Return false, indicating we wanna look for more events
 		})
 		t.Logf("%v events", n)
 	}
 }
 
-// tests (*State).IsMajorChangeFrom
-func TestIsMajorChangeFrom(t *testing.T) {
+func TestInterfaceIPDisappeared(t *testing.T) {
+	ip := netip.MustParseAddr("192.0.2.1")
+
+	stateWithIP := func(ip netip.Addr) *State {
+		return &State{InterfaceIPs: map[string][]netip.Prefix{
+			"eth0": {netip.PrefixFrom(ip, ip.BitLen())},
+		}}
+	}
+	stateWithoutIP := func() *State {
+		return &State{InterfaceIPs: map[string][]netip.Prefix{
+			"eth0": {netip.MustParsePrefix("198.51.100.1/32")},
+		}}
+	}
+
 	tests := []struct {
-		name   string
-		s1, s2 *State
-		want   bool
+		name string
+		old  *State
+		new  *State
+		want bool
 	}{
 		{
-			name: "eq_nil",
-			want: false,
+			name: "initial_state",
+			new:  stateWithIP(ip),
 		},
+		{
+			name: "disappeared",
+			old:  stateWithIP(ip),
+			new:  stateWithoutIP(),
+			want: true,
+		},
+		{
+			name: "unchanged_present",
+			old:  stateWithIP(ip),
+			new:  stateWithIP(ip),
+		},
+		{
+			name: "appeared",
+			old:  stateWithoutIP(),
+			new:  stateWithIP(ip),
+		},
+		{
+			name: "unchanged_absent",
+			old:  stateWithoutIP(),
+			new:  stateWithoutIP(),
+		},
+		{
+			name: "new_unknown",
+			old:  stateWithIP(ip),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cd := &ChangeDelta{old: tt.old, new: tt.new}
+			if got := cd.InterfaceIPDisappeared(ip); got != tt.want {
+				t.Fatalf("InterfaceIPDisappeared(%v) = %v; want %v", ip, got, tt.want)
+			}
+		})
+	}
+}
+
+// tests (*ChangeDelta).RebindRequired
+func TestRebindRequired(t *testing.T) {
+	// s1 must not be nil by definition
+	tests := []struct {
+		name     string
+		s1, s2   *State
+		tsIfName string
+		want     bool
+	}{
 		{
 			name: "nil_mix",
 			s2:   new(State),
@@ -184,6 +245,110 @@ func TestIsMajorChangeFrom(t *testing.T) {
 				DefaultRouteInterface: "foo",
 				InterfaceIPs: map[string][]netip.Prefix{
 					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "new-with-no-addr",
+			s1: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+					"bar": {},
+				},
+			},
+			want: false,
+		},
+		{
+			name:     "ignore-tailscale-interface-appearing",
+			tsIfName: "tailscale0",
+			s1: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo":        {netip.MustParsePrefix("10.0.1.2/16")},
+					"tailscale0": {netip.MustParsePrefix("100.69.4.20/32")},
+				},
+			},
+			want: false,
+		},
+		{
+			name:     "ignore-tailscale-interface-disappearing",
+			tsIfName: "tailscale0",
+			s1: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo":        {netip.MustParsePrefix("10.0.1.2/16")},
+					"tailscale0": {netip.MustParsePrefix("100.69.4.20/32")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "new-with-multicast-addr",
+			s1: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+					"bar": {netip.MustParsePrefix("224.0.0.1/32")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "old-with-addr-dropped",
+			s1: &State{
+				DefaultRouteInterface: "bar",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+					"bar": {netip.MustParsePrefix("192.168.0.1/32")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "bar",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"bar": {netip.MustParsePrefix("192.168.0.1/32")},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "old-with-no-addr-dropped",
+			s1: &State{
+				DefaultRouteInterface: "bar",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {},
+					"bar": {netip.MustParsePrefix("192.168.0.1/16")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "bar",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"bar": {netip.MustParsePrefix("192.168.0.1/16")},
 				},
 			},
 			want: false,
@@ -221,6 +386,8 @@ func TestIsMajorChangeFrom(t *testing.T) {
 			want: true,
 		},
 		{
+			// (barnstar) TODO: ULA addresses are only useful in some contexts,
+			// so maybe this shouldn't trigger rebinds after all? Needs more thought.
 			name: "ipv6-ula-addressed-appeared",
 			s1: &State{
 				DefaultRouteInterface: "foo",
@@ -233,17 +400,243 @@ func TestIsMajorChangeFrom(t *testing.T) {
 				InterfaceIPs: map[string][]netip.Prefix{
 					"foo": {
 						netip.MustParsePrefix("10.0.1.2/16"),
-						// Brad saw this address coming & going on his home LAN, possibly
-						// via an Apple TV Thread routing advertisement? (Issue 9040)
 						netip.MustParsePrefix("fd15:bbfa:c583:4fce:f4fb:4ff:fe1a:4148/64"),
 					},
 				},
 			},
-			want: true, // TODO(bradfitz): want false (ignore the IPv6 ULA address on foo)
+			want: true,
+		},
+		{
+			// (barnstar) TODO: ULA addresses are only useful in some contexts,
+			// so maybe this shouldn't trigger rebinds after all? Needs more thought.
+			name: "ipv6-ula-addressed-disappeared",
+			s1: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {
+						netip.MustParsePrefix("10.0.1.2/16"),
+						netip.MustParsePrefix("fd15:bbfa:c583:4fce:f4fb:4ff:fe1a:4148/64"),
+					},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "ipv6-link-local-addressed-appeared",
+			s1: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {netip.MustParsePrefix("10.0.1.2/16")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {
+						netip.MustParsePrefix("10.0.1.2/16"),
+						netip.MustParsePrefix("fe80::f242:25ff:fe64:b280/64"),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "ipv6-addressed-changed",
+			s1: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {
+						netip.MustParsePrefix("10.0.1.2/16"),
+						netip.MustParsePrefix("2001::f242:25ff:fe64:b280/64"),
+						netip.MustParsePrefix("fe80::f242:25ff:fe64:b280/64"),
+					},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "foo",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"foo": {
+						netip.MustParsePrefix("10.0.1.2/16"),
+						netip.MustParsePrefix("2001::beef:8bad:f00d:b280/64"),
+						netip.MustParsePrefix("fe80::f242:25ff:fe64:b280/64"),
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "have-addr-changed",
+			s1: &State{
+				HaveV6: false,
+				HaveV4: false,
+			},
+
+			s2: &State{
+				HaveV6: true,
+				HaveV4: true,
+			},
+			want: true,
+		},
+		{
+			name: "have-addr-unchanged",
+			s1: &State{
+				HaveV6: true,
+				HaveV4: true,
+			},
+
+			s2: &State{
+				HaveV6: true,
+				HaveV4: true,
+			},
+			want: false,
+		},
+		{
+			name: "new-is-less-expensive",
+			s1: &State{
+				IsExpensive: true,
+			},
+
+			s2: &State{
+				IsExpensive: false,
+			},
+			want: true,
+		},
+		{
+			name: "new-is-more-expensive",
+			s1: &State{
+				IsExpensive: false,
+			},
+
+			s2: &State{
+				IsExpensive: true,
+			},
+			want: false,
+		},
+		{
+			name: "uninteresting-interface-added",
+			s1: &State{
+				DefaultRouteInterface: "bar",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"bar": {netip.MustParsePrefix("192.168.0.1/16")},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "bar",
+				InterfaceIPs: map[string][]netip.Prefix{
+					"bar":    {netip.MustParsePrefix("192.168.0.1/16")},
+					"boring": {netip.MustParsePrefix("fd7a:115c:a1e0:ab12:4843:cd96:625e:13ce/64")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "interface-flags-changed-no-ip-change",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast, // FlagRunning removed
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			want: false,
+		},
+		{
+			name: "interface-mtu-changed-no-ip-change",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+						MTU:   1500,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+						MTU:   9000,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			want: false,
+		},
+		{
+			name: "interface-went-down",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagBroadcast | net.FlagMulticast, // FlagUp removed
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			want: true,
 		},
 	}
+
+	withIsInterestingInterface(t, func(ni Interface, pfxs []netip.Prefix) bool {
+		return !strings.HasPrefix(ni.Name, "boring")
+	})
+	saveAndRestoreTailscaleIfaceProps(t)
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+
 			// Populate dummy interfaces where missing.
 			for _, s := range []*State{tt.s1, tt.s2} {
 				if s == nil {
@@ -258,16 +651,251 @@ func TestIsMajorChangeFrom(t *testing.T) {
 				}
 			}
 
-			var m Monitor
-			m.om = &testOSMon{
-				Interesting: func(name string) bool { return true },
+			SetTailscaleInterfaceProps(tt.tsIfName, 1)
+			cd, err := NewChangeDelta(tt.s1, tt.s2, 0, true)
+			if err != nil {
+				t.Fatalf("NewChangeDelta error: %v", err)
 			}
-			if got := m.IsMajorChangeFrom(tt.s1, tt.s2); got != tt.want {
-				t.Errorf("IsMajorChange = %v; want %v", got, tt.want)
+			_ = cd // in case we need it later
+			if got := cd.RebindLikelyRequired; got != tt.want {
+				t.Errorf("RebindRequired = %v; want %v", got, tt.want)
 			}
 		})
 	}
 }
+
+func TestTimeJumpedDoesNotTriggerRebind(t *testing.T) {
+	s := &State{
+		DefaultRouteInterface: "en0",
+		Interface: map[string]Interface{
+			"en0": {Interface: &net.Interface{
+				Name:  "en0",
+				Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+			}},
+		},
+		InterfaceIPs: map[string][]netip.Prefix{
+			"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+		},
+		HaveV4: true,
+	}
+
+	// A short time jump (e.g., macOS DarkWake maintenance cycle ~55s)
+	// with unchanged network state should NOT trigger rebind.
+	cd, err := NewChangeDelta(s, s, 55*time.Second, true)
+	if err != nil {
+		t.Fatalf("NewChangeDelta error: %v", err)
+	}
+	if cd.RebindLikelyRequired {
+		t.Error("RebindLikelyRequired = true for short time jump with unchanged state; want false")
+	}
+	if !cd.TimeJumped() {
+		t.Error("TimeJumped = false; want true")
+	}
+
+	// A major time jump (>10m) with unchanged state SHOULD trigger rebind,
+	// because NAT mappings are likely stale.
+	cd2, err := NewChangeDelta(s, s, 2*time.Hour, true)
+	if err != nil {
+		t.Fatalf("NewChangeDelta error: %v", err)
+	}
+	if !cd2.RebindLikelyRequired {
+		t.Error("RebindLikelyRequired = false for major time jump (2h); want true")
+	}
+
+	// A short time jump with changed state SHOULD trigger rebind.
+	s2 := &State{
+		DefaultRouteInterface: "en0",
+		Interface: map[string]Interface{
+			"en0": {Interface: &net.Interface{
+				Name:  "en0",
+				Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+			}},
+		},
+		InterfaceIPs: map[string][]netip.Prefix{
+			"en0": {netip.MustParsePrefix("10.0.0.99/24")}, // IP changed
+		},
+		HaveV4: true,
+	}
+
+	saveAndRestoreTailscaleIfaceProps(t)
+	SetTailscaleInterfaceProps("", 0)
+
+	cd3, err := NewChangeDelta(s, s2, 55*time.Second, true)
+	if err != nil {
+		t.Fatalf("NewChangeDelta error: %v", err)
+	}
+	if !cd3.RebindLikelyRequired {
+		t.Error("RebindLikelyRequired = false for time jump with changed IP; want true")
+	}
+}
+
+func saveAndRestoreTailscaleIfaceProps(t *testing.T) {
+	t.Helper()
+	index, _ := TailscaleInterfaceIndex()
+	name, _ := TailscaleInterfaceName()
+	t.Cleanup(func() {
+		SetTailscaleInterfaceProps(name, index)
+	})
+}
+
+func withIsInterestingInterface(t *testing.T, fn func(Interface, []netip.Prefix) bool) {
+	t.Helper()
+	old := IsInterestingInterface
+	IsInterestingInterface = fn
+	t.Cleanup(func() { IsInterestingInterface = old })
+}
+
+func TestIncludesRoutableIP(t *testing.T) {
+	routable := []netip.Prefix{
+		netip.MustParsePrefix("1.2.3.4/32"),
+		netip.MustParsePrefix("10.0.0.1/24"),          // RFC1918 IPv4 (private)
+		netip.MustParsePrefix("172.16.0.1/12"),        // RFC1918 IPv4 (private)
+		netip.MustParsePrefix("192.168.1.1/24"),       // RFC1918 IPv4 (private)
+		netip.MustParsePrefix("fd15:dead:beef::1/64"), // IPv6 ULA
+		netip.MustParsePrefix("2001:db8::1/64"),       // global IPv6
+	}
+
+	nonRoutable := []netip.Prefix{
+		netip.MustParsePrefix("ff00::/8"),     // multicast IPv6 (should be filtered)
+		netip.MustParsePrefix("fe80::1/64"),   // link-local IPv6
+		netip.MustParsePrefix("::1/128"),      // loopback IPv6
+		netip.MustParsePrefix("::/128"),       // unspecified IPv6
+		netip.MustParsePrefix("224.0.0.1/32"), // multicast IPv4
+		netip.MustParsePrefix("127.0.0.1/32"), // loopback IPv4
+	}
+
+	got, want := filterRoutableIPs(
+		append(nonRoutable, routable...),
+	), routable
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("filterRoutableIPs returned %v; want %v", got, want)
+	}
+}
+
+func TestPrefixesEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []netip.Prefix
+		want bool
+	}{
+		{
+			name: "empty",
+			a:    []netip.Prefix{},
+			b:    []netip.Prefix{},
+			want: true,
+		},
+		{
+			name: "single-equal",
+			a:    []netip.Prefix{netip.MustParsePrefix("10.0.0.1/24")},
+			b:    []netip.Prefix{netip.MustParsePrefix("10.0.0.1/24")},
+			want: true,
+		},
+		{
+			name: "single-different",
+			a:    []netip.Prefix{netip.MustParsePrefix("10.0.0.1/24")},
+			b:    []netip.Prefix{netip.MustParsePrefix("10.0.0.2/24")},
+			want: false,
+		},
+		{
+			name: "unordered-equal",
+			a: []netip.Prefix{
+				netip.MustParsePrefix("10.0.0.1/24"),
+				netip.MustParsePrefix("10.0.2.1/24"),
+			},
+			b: []netip.Prefix{
+				netip.MustParsePrefix("10.0.2.1/24"),
+				netip.MustParsePrefix("10.0.0.1/24"),
+			},
+			want: true,
+		},
+		{
+			name: "subset",
+			a: []netip.Prefix{
+				netip.MustParsePrefix("10.0.2.1/24"),
+			},
+			b: []netip.Prefix{
+				netip.MustParsePrefix("10.0.2.1/24"),
+				netip.MustParsePrefix("10.0.0.1/24"),
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := prefixesEqual(tt.a, tt.b)
+			if got != tt.want {
+				t.Errorf("prefixesEqual(%v, %v) = %v; want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInterfaceDiff(t *testing.T) {
+	tests := []struct {
+		name     string
+		s1, s2   *State
+		wantDiff string // substring expected in diff output; "" means no diff
+	}{
+		{
+			name:     "equal",
+			s1:       &State{HaveV4: true, DefaultRouteInterface: "en0"},
+			s2:       &State{HaveV4: true, DefaultRouteInterface: "en0"},
+			wantDiff: "",
+		},
+		{
+			name: "flags-changed",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagRunning,
+					}},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp,
+					}},
+				},
+			},
+			wantDiff: "flags",
+		},
+		{
+			name: "mtu-changed",
+			s1: &State{
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{Name: "en0", MTU: 1500}},
+				},
+			},
+			s2: &State{
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{Name: "en0", MTU: 9000}},
+				},
+			},
+			wantDiff: "MTU",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.s1.InterfaceDiff(tt.s2)
+			if tt.wantDiff == "" {
+				if got != "" {
+					t.Errorf("InterfaceDiff = %q; want empty", got)
+				}
+			} else {
+				if !strings.Contains(got, tt.wantDiff) {
+					t.Errorf("InterfaceDiff = %q; want substring %q", got, tt.wantDiff)
+				}
+			}
+		})
+	}
+}
+
 func TestForeachInterface(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -306,16 +934,4 @@ func TestForeachInterface(t *testing.T) {
 			}
 		})
 	}
-}
-
-type testOSMon struct {
-	osMon
-	Interesting func(name string) bool
-}
-
-func (m *testOSMon) IsInterestingInterface(name string) bool {
-	if m.Interesting == nil {
-		return true
-	}
-	return m.Interesting(name)
 }

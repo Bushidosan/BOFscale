@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package lapitest
@@ -45,7 +45,7 @@ func newBackend(opts *options) *ipnlocal.LocalBackend {
 		tb.Fatalf("NewLocalBackend: %v", err)
 	}
 	tb.Cleanup(b.Shutdown)
-	b.SetControlClientGetterForTesting(opts.MakeControlClient)
+	b.ForTest().SetControlClientGetter(opts.MakeControlClient)
 	return b
 }
 

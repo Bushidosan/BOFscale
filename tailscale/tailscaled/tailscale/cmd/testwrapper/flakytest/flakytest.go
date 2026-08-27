@@ -1,9 +1,14 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package flakytest contains test helpers for marking a test as flaky. For
-// tests run using cmd/testwrapper, a failed flaky test will cause tests to be
-// re-run a few time until they succeed or exceed our iteration limit.
+// Package flakytest contains test helpers for marking a test as flaky.
+//
+// Marking a test with [Mark] is not required for cmd/testwrapper to retry
+// failed tests; the wrapper retries any failure within a per-test time
+// budget and reports a test as flaky if it ever passes on retry. Mark is
+// useful for tracking a known-flaky test against a GitHub issue and for the
+// TS_SKIP_FLAKY_TESTS skip behavior used to keep CI green when a flake is
+// being investigated.
 package flakytest
 
 import (
@@ -11,6 +16,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -60,6 +66,10 @@ func Mark(t testing.TB, issue string) {
 	// And then remove this Logf a month or so after that.
 	t.Logf("flakytest: issue tracking this flaky test: %s", issue)
 
+	if boolEnv("TS_SKIP_FLAKY_TESTS") {
+		t.Skipf("skipping due to TS_SKIP_FLAKY_TESTS")
+	}
+
 	// Record the root test name as flakey.
 	rootFlakesMu.Lock()
 	defer rootFlakesMu.Unlock()
@@ -79,4 +89,13 @@ func Marked(t testing.TB) bool {
 		}
 	}
 	return false
+}
+
+func boolEnv(k string) bool {
+	s := os.Getenv(k)
+	if s == "" {
+		return false
+	}
+	v, _ := strconv.ParseBool(s)
+	return v
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // netlogfmt parses a stream of JSON log messages from stdin and
@@ -45,6 +45,7 @@ import (
 	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/go-json-experiment/json/jsontext"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/bools"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netlogtype"
@@ -77,6 +78,7 @@ func main() {
 	*resolveAddrs = strings.ReplaceAll(*resolveAddrs, "-", "") // ignore dashes
 	*resolveAddrs = strings.ReplaceAll(*resolveAddrs, "_", "") // ignore underscores
 	switch *resolveAddrs {
+	case "":
 	case "id", "nodeid":
 		*resolveAddrs = "nodeid"
 	case "name", "hostname":
@@ -293,7 +295,7 @@ func printMessage(msg message) {
 		fmt.Printf("NodeID: %s\n", msg.NodeID)
 	}
 	formatTime := func(t time.Time) string {
-		return t.In(time.Local).Format("2006-01-02 15:04:05.000")
+		return t.Local().Format(tstime.DateSpTimeMilliZ)
 	}
 	switch {
 	case !msg.Logged.IsZero():
