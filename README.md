@@ -44,10 +44,10 @@ sudo ./tailscale up \
 
 ### 3. Per-Implant Workflow
 
-Start the daemon as an async BOF:
+Start the daemon as an async BOF. `socksportfwd` talks to `tailscaled`'s SOCKS5 proxy, which is off by default — pass `-socks5-server` when starting the daemon so it's listening:
 
 ```
-tailscaled
+tailscaled -socks5-server localhost:1055
 ```
 
 Note the socket path from the output, then enroll:
@@ -66,7 +66,7 @@ tailscale --socket \\.\pipe\<uuid> status
 Forward a local port to the tailnet for relay scenarios:
 
 ```
-socksportfwd --t attackvm.target.tun --tp 8888 --p 8888
+socksportfwd --t attackvm.target.tun --tp 8888 --p 8888 --sp 1055
 ```
 
 ## Building
