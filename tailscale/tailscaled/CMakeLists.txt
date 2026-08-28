@@ -10,6 +10,7 @@ set(GO_OUTPUT_EXE ${CMAKE_BINARY_DIR}/tailscaled.${ARCH}/tailscaled.exe)
 set(GO_OUTPUT_CLI_EXE ${CMAKE_BINARY_DIR}/tailscaled.${ARCH}/tailscale.exe)
 
 set(GO_OUTPUT_LINUX ${CMAKE_BINARY_DIR}/tailscaled.${ARCH}/tailscaled)
+set(GO_OUTPUT_CLI_LINUX ${CMAKE_BINARY_DIR}/tailscaled.${ARCH}/tailscale)
 
 if(${ARCH} MATCHES "x64")
     set(GO_COMPILER "x86_64-w64-mingw32-gcc")
@@ -58,15 +59,26 @@ add_custom_command(
     DEPENDS ${GO_SRC_DIR}
 )
 
+add_custom_command(
+    OUTPUT ${GO_OUTPUT_CLI_LINUX}
+    COMMAND ${CMAKE_COMMAND} -E env
+        GOOS=linux GOARCH=${GO_ARCH} CGO_ENABLED=0
+        go build -trimpath -ldflags="-s -w" -o ${GO_OUTPUT_CLI_LINUX}
+    WORKING_DIRECTORY ${GO_SRC_CLI_DIR}
+    DEPENDS ${GO_SRC_CLI_DIR}
+)
+
 add_custom_target(tailscaled.${ARCH} ALL DEPENDS ${GO_OUTPUT})
 add_custom_target(tailscaled_cmd.${ARCH} ALL DEPENDS ${GO_OUTPUT_EXE})
 add_custom_target(tailscale_cmd.${ARCH} ALL DEPENDS ${GO_OUTPUT_CLI_EXE})
 add_custom_target(tailscaled_linux.${ARCH} ALL DEPENDS ${GO_OUTPUT_LINUX})
+add_custom_target(tailscale_linux.${ARCH} ALL DEPENDS ${GO_OUTPUT_CLI_LINUX})
 add_dependencies(tailscaled.${ARCH} beacon)
 
 install(FILES ${GO_OUTPUT} DESTINATION "pe/")
 install(FILES ${GO_OUTPUT_EXE} DESTINATION "${ARCH}/")
 install(FILES ${GO_OUTPUT_CLI_EXE} DESTINATION "${ARCH}/")
 install(FILES ${GO_OUTPUT_LINUX} DESTINATION "${ARCH}/")
+install(FILES ${GO_OUTPUT_CLI_LINUX} DESTINATION "${ARCH}/")
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/${ARCH}/wintun.dll DESTINATION "${ARCH}/")
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/tailscaled_ost_bof.s1.py DESTINATION "ost/")
