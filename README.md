@@ -98,7 +98,7 @@ dist/
 │   ├── tailscaled.exe
 │   ├── tailscale.exe
 │   ├── tailscaled
-│   ├── tailscaled
+│   ├── tailscale
 │   └── wintun.dll
 └── ost/
     ├── tailscale_ost_bof.s1.py       # Outflank Stage1 integration
