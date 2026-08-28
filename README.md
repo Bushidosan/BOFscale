@@ -91,11 +91,13 @@ dist/
 │   ├── tailscaled.exe                # Standalone tailscaled for attack VM
 │   ├── tailscale.exe                 # Standalone tailscale CLI for attack VM
 │   ├── tailscaled                    # Linux tailscaled binary
+│   ├── tailscale                    # Linux tailscale client binary
 │   └── wintun.dll                    # WinTun driver (bundled)
 ├── x86/
 │   ├── beacon.dll
 │   ├── tailscaled.exe
 │   ├── tailscale.exe
+│   ├── tailscaled
 │   ├── tailscaled
 │   └── wintun.dll
 └── ost/
